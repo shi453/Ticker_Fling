@@ -20,6 +20,7 @@ CONFIG = {
     "chart_days": 252,         # how many trading days to draw on the chart
     "benchmark": "^NSEI",      # index used for Relative Strength (NIFTY 50)
     # detection
+    "box_method": "Pivot High",  # "Pivot High" (default) or "Darvas Box"
     "pivot_window": 3,         # bars on each side for a swing-high pivot
     "res_lookback": 120,       # fallback resistance lookback
     "touch_tolerance": 0.01,   # +/-1% counts as "touching" resistance
@@ -233,6 +234,20 @@ def add_indicators(df):
     # On-Balance Volume: cumulative volume signed by the day's price change.
     df["OBV"] = (np.sign(df["Close"].diff()).fillna(0) * df["Volume"]).cumsum()
 
+    # ADX(14) — trend STRENGTH (Wilder). +DI/-DI give direction.
+    period = 14
+    up_move = df["High"].diff()
+    down_move = -df["Low"].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    atr_w = df["TR"].ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_w
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_w
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    df["ADX"] = dx.ewm(alpha=1 / period, adjust=False).mean()
+    df["PLUS_DI"] = plus_di
+    df["MINUS_DI"] = minus_di
+
     return df
 
 
@@ -342,6 +357,42 @@ def base_metrics(df, resistance, cap=None, tol=0.005):
     base_low = float(lows[start:].min())
     depth = (resistance - base_low) / resistance * 100
     return length, depth, base_low
+
+
+def darvas_box(df, confirm=3, lookback=None):
+    """
+    Most recent Darvas box.
+      • Ceiling (box top) = the highest 'confirmed' high — a high not exceeded by
+        the next `confirm` bars (Darvas's rule for a held top).
+      • Floor (box bottom) = the lowest low made after that top.
+    Returns {top, bottom, top_date, bottom_date}.
+    """
+    confirm = confirm or 3
+    lookback = lookback or CONFIG["res_lookback"]
+    sub = df.tail(lookback)
+    highs = sub["High"].values
+    lows = sub["Low"].values
+    idx = sub.index
+    n = len(highs)
+
+    top, top_i, best = None, None, -1.0
+    for i in range(max(0, n - confirm)):
+        h = highs[i]
+        if h > best and all(highs[i + 1 + k] < h for k in range(confirm)):
+            top, top_i, best = float(h), i, float(h)
+    if top is None:                                   # fallback: plain highest high
+        top_i = int(highs.argmax())
+        top = float(highs[top_i])
+
+    if top_i + 1 < n:
+        region = lows[top_i + 1:]
+        bottom = float(region.min())
+        bottom_i = top_i + 1 + int(region.argmin())
+    else:
+        bottom = float(lows[top_i])
+        bottom_i = top_i
+    return {"top": top, "bottom": bottom,
+            "top_date": idx[top_i], "bottom_date": idx[bottom_i]}
 
 
 # =====================================================================
@@ -480,11 +531,14 @@ def calculate_score(df, resistance, cfg):
 # =====================================================================
 # TRADE PLANNER
 # =====================================================================
-def trade_levels(df, resistance):
+def trade_levels(df, resistance, structural_stop=None):
     price = df["Close"].iloc[-1]
     atr = df["ATR14"].iloc[-1]
     entry = resistance * 1.002              # trigger just above resistance
-    stop = entry - 1.5 * atr                # volatility-based stop
+    if structural_stop is not None and structural_stop < entry:
+        stop = structural_stop * 0.997     # Darvas: just below the box floor
+    else:
+        stop = entry - 1.5 * atr           # volatility-based stop
     risk = entry - stop
     target = entry + 2 * risk               # 2R target
     rr = (target - entry) / risk if risk else 0
@@ -519,17 +573,25 @@ def backtest(df, cfg):
     n = len(data)
     trades = []
 
+    darvas = cfg.get("box_method") == "Darvas Box"
     i = cfg["min_bars"]
     while i < n - 1:
         sub = data.iloc[:i + 1]
-        res = find_resistance(sub)
+        if darvas:
+            bx = darvas_box(sub)
+            res, sstop = bx["top"], bx["bottom"]
+        else:
+            res, sstop = find_resistance(sub), None
         score = calculate_score(sub, res, cfg)[0]
         confirmed = breakout_confirmed(sub, res, cfg["vol_surge_mult"])[0]
 
         if score >= threshold and confirmed:
             atr = sub["ATR14"].iloc[-1]
             entry = res * 1.002
-            stop = entry - 1.5 * atr
+            if sstop is not None and sstop < entry:
+                stop = sstop * 0.997
+            else:
+                stop = entry - 1.5 * atr
             risk = entry - stop
             target = entry + 2 * risk
 
@@ -578,12 +640,23 @@ def build_stats(df, info):
     price = info.get("currentPrice") or info.get("regularMarketPrice") or df["Close"].iloc[-1]
     wk_high = info.get("fiftyTwoWeekHigh") or df["High"].tail(252).max()
     wk_low = info.get("fiftyTwoWeekLow") or df["Low"].tail(252).min()
+
+    # ADX = trend strength; +DI vs -DI = direction
+    adx = df["ADX"].iloc[-1] if "ADX" in df else np.nan
+    if pd.isna(adx):
+        adx_str = "N/A"
+    else:
+        strength = "strong trend" if adx >= 25 else "building" if adx >= 20 else "weak / choppy"
+        bullish = df["PLUS_DI"].iloc[-1] >= df["MINUS_DI"].iloc[-1]
+        adx_str = f"{adx:.1f} ({strength}, {'↑ bullish' if bullish else '↓ bearish'})"
+
     return {
         "Current Price": fmt(price),
         "52-Week High": fmt(wk_high),
         "52-Week Low": fmt(wk_low),
         "All-Time High": fmt(float(df["High"].max())),
         "All-Time Low": fmt(float(df["Low"].min())),
+        "ADX (14)": adx_str,
         "Trailing P/E": fmt(info.get("trailingPE")),
         "Forward P/E": fmt(info.get("forwardPE")),
         "Sector": info.get("sector", "N/A"),
@@ -613,9 +686,19 @@ def analyze(ticker, cfg):
         return {"error": f"Only {len(raw)} bars — need >= {cfg['min_bars']}"}
 
     df = add_indicators(raw)
-    resistance = find_resistance(df)
+
+    # resistance / stop depend on the chosen box method
+    if cfg.get("box_method") == "Darvas Box":
+        box = darvas_box(df)
+        resistance = box["top"]
+        structural_stop = box["bottom"]
+    else:
+        box = None
+        resistance = find_resistance(df)
+        structural_stop = None
+
     score, checklist, dist_pct, dist_pts, touches = calculate_score(df, resistance, cfg)
-    price, entry, stop, target, atr, risk, rr = trade_levels(df, resistance)
+    price, entry, stop, target, atr, risk, rr = trade_levels(df, resistance, structural_stop)
     confirmed, above, vol_ok, last_vol, avg_vol = breakout_confirmed(
         df, resistance, cfg["vol_surge_mult"])
     base_len, base_depth, base_low = base_metrics(df, resistance)
@@ -628,6 +711,7 @@ def analyze(ticker, cfg):
         "signal": get_signal(score), "confirmed": confirmed,
         "above": above, "vol_ok": vol_ok, "last_vol": last_vol, "avg_vol": avg_vol,
         "base_len": base_len, "base_depth": base_depth, "base_low": base_low,
+        "box": box, "box_method": cfg.get("box_method", "Pivot High"),
     }
 
 
@@ -647,6 +731,11 @@ cfg = dict(CONFIG)
 
 cfg["benchmark"] = st.sidebar.text_input("Benchmark (Relative Strength)", CONFIG["benchmark"])
 CONFIG["benchmark"] = cfg["benchmark"]
+cfg["box_method"] = st.sidebar.selectbox(
+    "Box / resistance method", ["Pivot High", "Darvas Box"],
+    help="Pivot High (default) = swing-high resistance. Darvas Box = the box top "
+         "(ceiling) is the breakout trigger and the box floor is a structural stop. "
+         "Switch and re-run the backtest to compare which works better for a stock.")
 cfg["near_pct"] = st.sidebar.slider("Near-resistance threshold (%)", 1.0, 10.0, CONFIG["near_pct"], 0.5)
 cfg["vol_surge_mult"] = st.sidebar.slider("Breakout volume surge (×avg)", 1.0, 3.0, CONFIG["vol_surge_mult"], 0.1)
 c_lo, c_hi = st.sidebar.slider("Healthy RSI band", 0, 100, (CONFIG["rsi_low"], CONFIG["rsi_high"]))
@@ -694,7 +783,7 @@ with st.sidebar.expander(f"📋 Watchlist ({len(_wl)})"):
 # =====================================================================
 # MAIN UI
 # =====================================================================
-st.title("📈 Breakout Scanner Pro (V4)")
+st.title("📈 Siva's Darvas Pivot Breakout")
 
 mode = st.radio("Mode", ["Single ticker (detailed)", "Scan multiple"], horizontal=True)
 
@@ -857,6 +946,12 @@ def render_single(ticker, res, cfg):
     info = load_info(ticker)
     stats = build_stats(res["df"], info)
 
+    # ----- method indicator -----
+    method = res.get("box_method", "Pivot High")
+    chip = "🟦 Darvas Box" if method == "Darvas Box" else "🟩 Pivot High"
+    st.markdown(f"🧭 **Method:** {chip} — resistance & stop are derived from the "
+                f"**{method}** logic (change it in the sidebar).")
+
     # ----- market regime + plain-language summary -----
     render_regime(cfg)
     st.info(plain_summary(ticker, res, cfg))
@@ -904,12 +999,15 @@ def render_single(ticker, res, cfg):
         s1, s2, s3 = st.columns(3)
         groups = [
             ["Current Price", "52-Week High", "52-Week Low", "All-Time High", "All-Time Low"],
-            ["Market Cap", "Trailing P/E", "Forward P/E", "Industry P/E"],
+            ["ADX (14)", "Market Cap", "Trailing P/E", "Forward P/E", "Industry P/E"],
             ["Sector", "Industry", "Promoter/Insider Holding", "Institutional Holding"],
         ]
         for col, keys in zip((s1, s2, s3), groups):
             for k in keys:
                 col.write(f"**{k}:** {stats[k]}")
+        st.caption("ℹ️ ADX measures trend **strength**, not direction: ≥25 = strong trend, "
+                   "20–25 = building, <20 = weak/choppy (breakouts whipsaw more in chop). "
+                   "+DI vs −DI gives the bullish/bearish bias.")
         if stats["Industry P/E"].startswith("N/A"):
             st.caption("ℹ️ Industry/sector average P/E is not available from Yahoo Finance's "
                        "free API — compare the stock's Trailing P/E against peers manually.")
@@ -950,10 +1048,11 @@ def render_single(ticker, res, cfg):
 
 def render_backtest(ticker, res, cfg):
     st.write("### 🔁 Backtest — does this score actually work?")
-    st.caption(f"Replays history: every time the score reached **≥ {cfg['bt_threshold']}** "
-               f"with a volume-confirmed breakout, it simulates the same Entry/Stop/Target "
-               f"and checks whether Target (+2R) or Stop (−1R) hit first within "
-               f"{cfg['bt_horizon']} bars.")
+    st.caption(f"Replays history using the **{cfg.get('box_method', 'Pivot High')}** method: "
+               f"every time the score reached **≥ {cfg['bt_threshold']}** with a "
+               f"volume-confirmed breakout, it simulates the same Entry/Stop/Target and "
+               f"checks whether Target (+2R) or Stop (−1R) hit first within "
+               f"{cfg['bt_horizon']} bars. Switch the method in the sidebar and re-run to compare.")
     if st.button("Run backtest"):
         st.session_state["run_bt"] = True
     if not st.session_state.get("run_bt"):
@@ -1016,6 +1115,21 @@ def render_chart(ticker, res):
     fig.add_trace(go.Scatter(x=df.index, y=avg20, name="20-day avg vol",
                              line=dict(color="black", width=1.2)), row=2, col=1)
 
+    # ---- Darvas box (ceiling / floor) drawn as a shaded rectangle ----
+    box = res.get("box")
+    if box:
+        x0 = max(pd.Timestamp(box["top_date"]), df.index[0]).isoformat()
+        x1 = df.index[-1].isoformat()
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=box["bottom"], y1=box["top"],
+                      line=dict(color="rgba(41,98,255,0.7)", width=1.2),
+                      fillcolor="rgba(41,98,255,0.08)", row=1, col=1)
+        fig.add_annotation(x=x1, y=box["top"], text=f"Ceiling {box['top']:.2f}",
+                           showarrow=False, yshift=10, font=dict(color="#2962ff", size=11),
+                           row=1, col=1)
+        fig.add_annotation(x=x1, y=box["bottom"], text=f"Floor {box['bottom']:.2f}",
+                           showarrow=False, yshift=-10, font=dict(color="#2962ff", size=11),
+                           row=1, col=1)
+
     # highlight the breakout bar if confirmed today
     if res["confirmed"]:
         bx = df.index[-1].isoformat()       # ISO string avoids a plotly Timestamp bug
@@ -1023,8 +1137,9 @@ def render_chart(ticker, res):
         fig.add_annotation(x=bx, y=res["resistance"], text="Breakout", showarrow=False,
                            yshift=10, font=dict(color="green", size=11), row=1, col=1)
 
+    title_suffix = "Darvas Box" if box else "Pivot High"
     fig.update_layout(height=760, xaxis_rangeslider_visible=False,
-                      title=f"{ticker} Breakout Scanner",
+                      title=f"{ticker} Breakout Scanner ({title_suffix})",
                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
@@ -1121,12 +1236,20 @@ else:
                 "Score", ascending=False, na_position="last").reset_index(drop=True)
         st.session_state["scan_table"] = table
         st.session_state["scan_detail"] = None      # clear previously opened detail
+        st.session_state["scan_method"] = cfg.get("box_method", "Pivot High")
 
     # ----- persisted results + one-click drill-down -----
     if st.session_state.get("scan_table") is not None:
         table = st.session_state["scan_table"]
         render_regime(cfg)
+        used = st.session_state.get("scan_method", "Pivot High")
+        chip = "🟦 Darvas Box" if used == "Darvas Box" else "🟩 Pivot High"
         st.write("### 🔍 Scan Results (best setups on top)")
+        st.markdown(f"🧭 **Method used for these results:** {chip}")
+        if cfg.get("box_method") != used:
+            st.warning(f"⚠️ You've switched the method to **{cfg.get('box_method')}** — "
+                       f"the table below still reflects **{used}**. Click **Scan** again "
+                       f"to recompute with the new method.")
         st.caption("👉 **Click a row** to load the full detailed analysis below.")
 
         # tidy decimals everywhere; red Stop %, green Target %. Selection still works.
