@@ -24,6 +24,18 @@ CONFIG = {
     "pivot_window": 3,         # bars on each side for a swing-high pivot
     "res_lookback": 120,       # fallback resistance lookback
     "touch_tolerance": 0.01,   # +/-1% counts as "touching" resistance
+    # long-tested base (multi-year horizontal ceiling)
+    "lb_lookback": 1000,       # bars to search for a long-tested level (~4y)
+    "lb_window": 5,            # pivot window for the long base
+    "lb_tol": 0.03,            # +/-3% counts as a touch of the level
+    "lb_min_touches": 3,       # min touches to call it a tested level
+    "lb_long_bars": 250,       # >= ~1y span = "long base"
+    "lb_multiyear_bars": 500,  # >= ~2y span = "multi-year base"
+    "lb_recent_bars": 126,     # ~6mo: a level needs a touch within this to stay "active"
+    "lb_min_recent": 1,        # min touches inside the recent window
+    "lb_cross_bars": 30,       # a breakout must be a FRESH cross (price below within N bars)
+    "lb_stop_lowbars": 60,     # recent-swing-low window for the level-based stop
+    "lb_stop_atr": 1.5,        # ATR multiple for the level-based stop
     # thresholds (editable in sidebar)
     "near_pct": 3.0,           # within X% of resistance = "near"
     "vol_surge_mult": 1.5,     # breakout volume must beat avg * this
@@ -395,6 +407,78 @@ def darvas_box(df, confirm=3, lookback=None):
             "top_date": idx[top_i], "bottom_date": idx[bottom_i]}
 
 
+def long_base(df, lookback=None, window=None, tol=None, min_touches=None,
+              recent_bars=None, min_recent=None):
+    """
+    Find the most-tested horizontal ceiling that is STILL ACTIVE.
+
+    Scans swing-high pivots in the lookback and clusters them by price (±tol).
+    A cluster only qualifies if it has >= min_touches total AND >= min_recent
+    touches within the last `recent_bars` — so stale levels the stock left behind
+    long ago are ignored. Also returns `bars_since_below` (how fresh any cross is).
+    Returns raw facts, or None if no active tested ceiling exists.
+    """
+    lookback = lookback or CONFIG["lb_lookback"]
+    window = window or CONFIG["lb_window"]
+    tol = tol or CONFIG["lb_tol"]
+    min_touches = min_touches or CONFIG["lb_min_touches"]
+    recent_bars = recent_bars or CONFIG["lb_recent_bars"]
+    min_recent = CONFIG["lb_min_recent"] if min_recent is None else min_recent
+
+    sub = df.tail(lookback)
+    highs = sub["High"].values
+    closes = sub["Close"].values
+    idx = sub.index
+    n = len(highs)
+    if n < 60:
+        return None
+
+    pivots = []                                   # (price, position)
+    for i in range(window, n - window):
+        if highs[i] >= highs[i - window:i].max() and highs[i] >= highs[i + 1:i + window + 1].max():
+            pivots.append((float(highs[i]), i))
+    if len(pivots) < min_touches:
+        return None
+
+    recent_cut = n - recent_bars
+    # most-touched cluster that is STILL ACTIVE (>= min_recent recent touches); tie -> higher level
+    best = None
+    for price, _ in pivots:
+        level = max(p for (p, q) in pivots if abs(p - price) <= price * tol)
+        tp = [q for (p, q) in pivots if abs(p - level) <= level * tol]
+        if len(tp) < min_touches:
+            continue
+        recent = sum(1 for q in tp if q >= recent_cut)
+        if recent < min_recent:
+            continue
+        key = (len(tp), level)
+        if best is None or key > best[0]:
+            best = (key, level, tp, recent)
+    if best is None:
+        return None
+
+    _, level, touch_pos, recent_touches = best
+    first_pos, last_pos = min(touch_pos), max(touch_pos)
+    below = np.where(closes < level)[0]
+    bars_since_below = int((n - 1) - below[-1]) if len(below) else None
+    last_close = float(closes[-1])
+    return {
+        "level": float(level),
+        "touches": len(touch_pos),
+        "recent_touches": int(recent_touches),
+        "bars_since_below": bars_since_below,
+        "span_bars": int(n - first_pos),
+        "first_date": idx[first_pos],
+        "last_touch_date": idx[last_pos],
+        "dist_pct": (level - last_close) / level * 100,
+        "broke": last_close > level,
+        "last_vol": float(sub["Volume"].iloc[-1]),
+        "avg_vol": float(sub["Volume"].tail(20).mean()),
+        "touch_dates": [idx[q] for q in touch_pos],
+        "touch_prices": [float(highs[q]) for q in touch_pos],
+    }
+
+
 # =====================================================================
 # INDIVIDUAL CHECKS  -> each returns (passed: bool, detail: str)
 # =====================================================================
@@ -638,6 +722,8 @@ def backtest(df, cfg):
 # =====================================================================
 def build_stats(df, info):
     price = info.get("currentPrice") or info.get("regularMarketPrice") or df["Close"].iloc[-1]
+    day_high = info.get("dayHigh") or info.get("regularMarketDayHigh") or df["High"].iloc[-1]
+    day_low = info.get("dayLow") or info.get("regularMarketDayLow") or df["Low"].iloc[-1]
     wk_high = info.get("fiftyTwoWeekHigh") or df["High"].tail(252).max()
     wk_low = info.get("fiftyTwoWeekLow") or df["Low"].tail(252).min()
 
@@ -652,6 +738,8 @@ def build_stats(df, info):
 
     return {
         "Current Price": fmt(price),
+        "Day High": fmt(day_high),
+        "Day Low": fmt(day_low),
         "52-Week High": fmt(wk_high),
         "52-Week Low": fmt(wk_low),
         "All-Time High": fmt(float(df["High"].max())),
@@ -703,6 +791,30 @@ def analyze(ticker, cfg):
         df, resistance, cfg["vol_surge_mult"])
     base_len, base_depth, base_low = base_metrics(df, resistance)
 
+    # long-tested horizontal ceiling ("multi-year base") — display/badge only
+    lb = long_base(df, cfg.get("lb_lookback"), cfg.get("lb_window"),
+                   cfg.get("lb_tol"), cfg.get("lb_min_touches"),
+                   cfg.get("lb_recent_bars"), cfg.get("lb_min_recent"))
+    if lb:
+        lb["vol_ratio"] = lb["last_vol"] / lb["avg_vol"] if lb["avg_vol"] else 0.0
+        vol_ok_lb = lb["vol_ratio"] >= cfg["vol_surge_mult"]
+        span = lb["span_bars"]
+        # a breakout must be a FRESH cross: price was below the level within the window
+        fresh_cross = lb["bars_since_below"] is not None and \
+            lb["bars_since_below"] <= cfg["lb_cross_bars"]
+        near = abs(lb["dist_pct"]) <= cfg["near_pct"]
+        if lb["broke"] and vol_ok_lb and fresh_cross:
+            if span >= cfg["lb_multiyear_bars"]:
+                lb["state"] = "multiyear_breakout"
+            elif span >= cfg["lb_long_bars"]:
+                lb["state"] = "long_breakout"
+            else:
+                lb["state"] = "breakout"
+        elif (not lb["broke"]) and near and span >= cfg["lb_long_bars"]:
+            lb["state"] = "testing"
+        else:
+            lb["state"] = "none"
+
     return {
         "df": df, "resistance": resistance, "score": score, "checklist": checklist,
         "dist_pct": dist_pct, "dist_pts": dist_pts, "touches": touches,
@@ -712,6 +824,7 @@ def analyze(ticker, cfg):
         "above": above, "vol_ok": vol_ok, "last_vol": last_vol, "avg_vol": avg_vol,
         "base_len": base_len, "base_depth": base_depth, "base_low": base_low,
         "box": box, "box_method": cfg.get("box_method", "Pivot High"),
+        "long_base": lb,
     }
 
 
@@ -762,6 +875,31 @@ with st.sidebar.expander("Backtest settings"):
                                   CONFIG["bt_horizon"], 5)
     cfg["bt_lookback"] = st.slider("History to test (bars)", 250, 2000,
                                    CONFIG["bt_lookback"], 250)
+
+with st.sidebar.expander("Long-base settings"):
+    cfg["lb_lookback"] = st.slider("Lookback (bars)", 250, 2500, CONFIG["lb_lookback"], 250,
+                                   help="How far back to search for a repeatedly-tested "
+                                        "ceiling. ~250 bars ≈ 1 year.")
+    cfg["lb_tol"] = st.slider("Touch tolerance (±%)", 1.0, 6.0,
+                              CONFIG["lb_tol"] * 100, 0.5) / 100
+    cfg["lb_min_touches"] = st.slider("Min touches", 2, 8, CONFIG["lb_min_touches"], 1)
+    cfg["lb_recent_bars"] = st.slider("Recent-touch window (bars)", 40, 378,
+                                      CONFIG["lb_recent_bars"], 20,
+                                      help="A level must have a touch within this many recent "
+                                           "bars to count as an ACTIVE ceiling (else it's stale "
+                                           "and ignored). ~126 bars ≈ 6 months.")
+    cfg["lb_cross_bars"] = st.slider("Fresh-cross window (bars)", 5, 90,
+                                     CONFIG["lb_cross_bars"], 5,
+                                     help="A breakout only counts if price was BELOW the level "
+                                          "within this many bars — a fresh cross, not one from "
+                                          "long ago.")
+    cfg["lb_stop_lowbars"] = st.slider("Stop: recent-low window (bars)", 20, 120,
+                                       CONFIG["lb_stop_lowbars"], 10,
+                                       help="Recent swing-low window for the level-based stop.")
+    cfg["lb_stop_atr"] = st.slider("Stop: ATR multiple", 1.0, 3.0,
+                                   CONFIG["lb_stop_atr"], 0.5,
+                                   help="ATR stop = level − N×ATR. The plan uses the tighter of "
+                                        "this and the recent swing low.")
 
 _wl = get_watchlist()
 with st.sidebar.expander(f"📋 Watchlist ({len(_wl)})"):
@@ -942,6 +1080,208 @@ def render_trade_plan(res, cfg):
         st.warning("Score below 65 — setup not yet high quality. Levels shown for planning only.")
 
 
+def longbase_badge(lb):
+    """(kind, message) for the long-base banner, or None if not noteworthy."""
+    if not lb or lb.get("state") in (None, "none"):
+        return None
+    yrs = lb["span_bars"] / 252
+    t, r, d = lb["touches"], lb.get("vol_ratio", 0), lb["dist_pct"]
+    s = lb["state"]
+    if s == "multiyear_breakout":
+        return ("success", f"🏆 **Multi-Year Base Breakout** — just cleared a ceiling tested "
+                f"**{t}× over ~{yrs:.1f} years** on **{r:.1f}× volume**. The bigger the base, "
+                f"the bigger the potential move — high-quality setup.")
+    if s == "long_breakout":
+        return ("success", f"🏅 **Long-Base Breakout** — cleared a level tested {t}× over "
+                f"~{yrs:.1f} years on {r:.1f}× volume.")
+    if s == "breakout":
+        return ("info", f"✅ **Base breakout** — cleared a level tested {t}× (base ~{yrs:.1f} yrs).")
+    if s == "testing":
+        return ("info", f"👀 **Testing a long-tested ceiling** — {t}× touches over ~{yrs:.1f} years, "
+                f"currently **{abs(d):.1f}% below**. Watch for a decisive high-volume break.")
+    return None
+
+
+def level_trade_plan(df, lb, cfg):
+    """
+    A trade plan anchored purely to the tested level + the stock's own structure:
+      Entry  = level * 1.002 (a decisive close above the ceiling)
+      Stop   = tighter of (level - N*ATR) and the recent swing low (kept below the level)
+      Target = nearest overhead pivot high(s) = "where sellers showed up before";
+               if none exist (all-time highs) -> measured-move projection.
+    """
+    level = lb["level"]
+    atr = float(df["ATR14"].iloc[-1])
+    cur = float(df["Close"].iloc[-1])
+    lowbars = cfg.get("lb_stop_lowbars", 60)
+    atr_mult = cfg.get("lb_stop_atr", 1.5)
+
+    entry = level * 1.002
+
+    # ---- stop: tighter (higher) of ATR-stop and recent swing low, kept below the level ----
+    stop, stop_rule = level - atr_mult * atr, f"{atr_mult:g}×ATR"
+    recent_low = float(df["Low"].tail(lowbars).min())
+    if recent_low < level:
+        swing_stop = recent_low * 0.997
+        if swing_stop > stop:                       # tighter wins
+            stop, stop_rule = swing_stop, f"recent {lowbars}-bar low"
+    stop = min(stop, level * 0.995)                 # ensure below the level
+    risk = entry - stop
+
+    # ---- targets: nearest overhead pivot highs above the entry/current price ----
+    lookback = cfg.get("lb_lookback", CONFIG["lb_lookback"])
+    win = cfg.get("lb_window", 5)
+    tol = cfg.get("lb_tol", 0.03)
+    h = df.tail(lookback)["High"].values
+    ref = max(entry, cur)
+    piv = sorted({float(h[i]) for i in range(win, len(h) - win)
+                  if h[i] >= h[i - win:i].max() and h[i] >= h[i + 1:i + win + 1].max()
+                  and h[i] > ref * (1 + tol)})     # meaningfully above (not the same zone)
+    zones = []                                       # collapse nearby pivots into one zone
+    for p in piv:
+        if not zones or p > zones[-1] * (1 + tol):
+            zones.append(p)
+
+    fallback = False
+    if zones:
+        t1 = zones[0]
+        t2 = zones[1] if len(zones) > 1 else None
+    else:                                            # blue-sky: measured move off recent range
+        recent = df.tail(cfg.get("lb_recent_bars", 126))
+        rng = float(recent["High"].max() - recent["Low"].min())
+        t1 = entry + rng if rng > 0 else entry + 3 * risk
+        t2 = None
+        fallback = True
+
+    rr = (t1 - entry) / risk if risk > 0 else 0
+    rr_now = (t1 - cur) / (cur - stop) if (cur - stop) > 0 else 0
+    return {"entry": entry, "stop": stop, "stop_rule": stop_rule, "risk": risk,
+            "t1": t1, "t2": t2, "rr": rr, "rr_now": rr_now, "fallback": fallback, "cur": cur}
+
+
+def render_long_base(res, cfg):
+    lb = res.get("long_base")
+    st.write("### 🏛 Long-Tested Base / Multi-Year Resistance")
+    st.caption("A horizontal ceiling that price has tested repeatedly over a long span. A "
+               "decisive, high-volume break of such a level is a higher-quality breakout than "
+               "a fresh 52-week-high tick — more overhead supply is cleared, and *the bigger "
+               "the base, the bigger the potential move.*")
+    if not lb:
+        st.info(f"No **active** long-tested ceiling found (need ≥ {cfg.get('lb_min_touches', 3)} "
+                f"touches within ±{cfg.get('lb_tol', 0.03) * 100:.0f}%, including at least one in "
+                "the recent window). Old levels the stock has already left far behind are "
+                "deliberately ignored. The stock may be trending freely, mid-range, or lack a "
+                "clear multi-touch level. Adjust tolerance/lookback/recent-window in the sidebar.")
+        return
+
+    yrs = lb["span_bars"] / 252
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tested level", fmt(lb["level"]))
+    c2.metric("Touches", lb["touches"],
+              help="Times price tested this ceiling (swing highs within the tolerance) over the lookback.")
+    c3.metric("Base duration", f"{yrs:.1f} yrs",
+              help=f"{lb['span_bars']} bars since the first touch on {lb['first_date']:%b %Y}.")
+    c4.metric("Distance", f"{lb['dist_pct']:+.2f}%",
+              help="How far current price is below (+) or above (−) the tested level.")
+
+    badge = longbase_badge(lb)
+    if badge:
+        (st.success if badge[0] == "success" else st.info)(badge[1])
+    elif lb["broke"]:
+        st.info("Price is above the level, but volume hasn't confirmed a decisive break yet.")
+    else:
+        st.caption(f"Not near a breakout: {abs(lb['dist_pct']):.1f}% from the level, "
+                   f"{lb['touches']}× touches over ~{yrs:.1f} yrs.")
+
+    # ----- extended vs at-the-level entry flag -----
+    d = lb["dist_pct"]                       # + = price below level, − = price above
+    band = cfg.get("near_pct", 3.0)
+    level = lb["level"]
+    if d <= -band:                           # price is well ABOVE the level → extended
+        st.warning(f"⏳ **Extended — don't chase.** Price is **{-d:.1f}% above** the base "
+                   f"({level:.2f}). The low-risk entry was *at* the level; consider waiting for "
+                   f"a **pullback/retest toward ~{level:.2f}** (old resistance → new support) "
+                   f"rather than buying here.")
+    elif -band < d < 0:                      # just above the level
+        st.success(f"🎯 **At the breakout zone** — price is just {-d:.1f}% above the base "
+                   f"({level:.2f}). Near an ideal entry *if it holds above the level*.")
+    elif 0 <= d <= band:                     # at / just below the level
+        st.info(f"👀 **At the level** — price is {d:.1f}% below {level:.2f}. A decisive, "
+                f"high-volume close **above** it would trigger the breakout.")
+    else:                                    # far below
+        st.caption(f"Price is {d:.1f}% below the tested level — not near a breakout yet.")
+
+    st.caption(f"First tested: **{lb['first_date']:%d %b %Y}** · most recent touch: "
+               f"**{lb['last_touch_date']:%d %b %Y}**.")
+
+    # ----- level-based trade plan (structural: level + own history) -----
+    plan = level_trade_plan(res["df"], lb, cfg)
+    st.write("#### 🎯 Level-Based Trade Plan")
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Entry (trigger)", fmt(plan["entry"]),
+              help="Tested level × 1.002 — a decisive close just above the ceiling.")
+    q2.metric("Stop", fmt(plan["stop"]),
+              delta=f"{(plan['stop']/plan['entry'] - 1) * 100:+.1f}%", delta_color="inverse",
+              help=f"Tighter of {cfg.get('lb_stop_atr', 1.5):g}×ATR and the recent swing low, "
+                   f"kept below the level. Rule used: {plan['stop_rule']}.")
+    q3.metric("Target 1", fmt(plan["t1"]),
+              delta=f"{(plan['t1']/plan['entry'] - 1) * 100:+.1f}%",
+              help="Nearest overhead resistance (prior swing high) — the first place sellers "
+                   "showed up. A measured-move projection is used if there's no overhead "
+                   "resistance (all-time highs).")
+    q4.metric("Reward : Risk", f"{plan['rr']:.1f} : 1")
+
+    bits = [f"Risk/share **{plan['risk']:.2f}**", f"Stop rule: **{plan['stop_rule']}**"]
+    if plan["t2"]:
+        bits.append(f"T2 **{fmt(plan['t2'])}** ({(plan['t2']/plan['entry'] - 1) * 100:+.1f}%)")
+    if plan["fallback"]:
+        bits.append("_T1 is a measured-move projection (blue-sky — no overhead resistance)_")
+    st.caption(" · ".join(bits))
+    if plan["cur"] > plan["entry"]:
+        st.caption(f"⏳ From the current price ({fmt(plan['cur'])}) the reward:risk is only "
+                   f"**{plan['rr_now']:.1f} : 1** — you'd be chasing. A pullback/retest toward "
+                   f"**{fmt(plan['entry'])}** restores the ~{plan['rr']:.1f}:1.")
+    elif plan["cur"] < plan["entry"]:
+        st.caption(f"ℹ️ Price ({fmt(plan['cur'])}) is still **below** the trigger — this is the "
+                   f"plan *if/when* it breaks **{fmt(plan['entry'])}**, not a live entry yet.")
+
+    # ----- chart: price + tested level + touch markers, with a volume panel -----
+    df = res["df"].tail(cfg.get("lb_lookback", CONFIG["lb_lookback"]))
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                        row_heights=[0.72, 0.28])
+    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close",
+                             line=dict(color="#1f77b4", width=1)), row=1, col=1)
+    fig.add_hline(y=level, line_dash="dash", line_color="#d62728",
+                  annotation_text=f"Tested level {level:.2f}", row=1, col=1)
+    fig.add_trace(go.Scatter(x=lb["touch_dates"], y=lb["touch_prices"], mode="markers",
+                             name="Touches",
+                             marker=dict(color="#d62728", size=10, symbol="circle-open",
+                                         line=dict(width=2))), row=1, col=1)
+    # level-based trade-plan lines
+    for y, color, label in [
+        (plan["entry"], "#1f77b4", "Entry"),
+        (plan["stop"], "#e74c3c", "Stop"),
+        (plan["t1"], "#2ca02c", "Target 1"),
+    ]:
+        fig.add_hline(y=y, line_dash="dot", line_color=color, annotation_text=label, row=1, col=1)
+    if plan["t2"]:
+        fig.add_hline(y=plan["t2"], line_dash="dot", line_color="#2ca02c",
+                      annotation_text="Target 2", row=1, col=1)
+    # volume panel — green up-days / red down-days + 20-day average
+    up = df["Close"] >= df["Open"]
+    bar_colors = ["#26a69a" if u else "#ef5350" for u in up]
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=bar_colors,
+                         name="Volume", showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["Volume"].rolling(20).mean(),
+                             name="20-day avg vol", line=dict(color="black", width=1.2)),
+                  row=2, col=1)
+    fig.update_layout(height=560, title="Long-tested ceiling, touches & volume",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def render_single(ticker, res, cfg):
     info = load_info(ticker)
     stats = build_stats(res["df"], info)
@@ -990,15 +1330,22 @@ def render_single(ticker, res, cfg):
     elif res["above"]:
         st.info("Price is above resistance but volume hasn't confirmed yet.")
 
+    # ----- multi-year base breakout badge (prominent) -----
+    _badge = longbase_badge(res.get("long_base"))
+    if _badge:
+        (st.success if _badge[0] == "success" else st.info)(_badge[1])
+
     # ----- tabs -----
-    tab_o, tab_c, tab_t, tab_ch, tab_b = st.tabs(
-        ["📋 Overview", "📊 Checklist", "💰 Trade Plan", "📈 Chart", "🔁 Backtest"])
+    tab_o, tab_c, tab_t, tab_ch, tab_lb, tab_b = st.tabs(
+        ["📋 Overview", "📊 Checklist", "💰 Trade Plan", "📈 Chart",
+         "🏛 Long Base", "🔁 Backtest"])
 
     with tab_o:
         st.write("#### 🧾 Current Stats")
         s1, s2, s3 = st.columns(3)
         groups = [
-            ["Current Price", "52-Week High", "52-Week Low", "All-Time High", "All-Time Low"],
+            ["Current Price", "Day High", "Day Low", "52-Week High", "52-Week Low",
+             "All-Time High", "All-Time Low"],
             ["ADX (14)", "Market Cap", "Trailing P/E", "Forward P/E", "Industry P/E"],
             ["Sector", "Industry", "Promoter/Insider Holding", "Institutional Holding"],
         ]
@@ -1041,6 +1388,9 @@ def render_single(ticker, res, cfg):
 
     with tab_ch:
         render_chart(ticker, res)
+
+    with tab_lb:
+        render_long_base(res, cfg)
 
     with tab_b:
         render_backtest(ticker, res, cfg)
@@ -1205,11 +1555,27 @@ else:
                 entry = res["entry"]
                 stop_pct = (res["stop"] - entry) / entry * 100
                 tgt_pct = (res["target"] - entry) / entry * 100
+                vol_ratio = res["last_vol"] / res["avg_vol"] if res["avg_vol"] else None
+
+                lb = res.get("long_base")
+                if lb:
+                    my_dist = round(lb["dist_pct"], 2)
+                    flag = {"multiyear_breakout": "🏆", "long_breakout": "🏅",
+                            "breakout": "✅", "testing": "👀"}.get(lb.get("state"), "")
+                    my_base = f"{flag} {lb['touches']}×" if flag else f"{lb['touches']}×"
+                else:
+                    my_dist, my_base = None, "—"
+
                 rows.append({
                     "Ticker": tk,
                     "Score": res["score"],
                     "Signal": res["signal"],
                     "Breakout?": "🚀" if res["confirmed"] else "",
+                    "MY Base": my_base,
+                    "MY Dist %": my_dist,
+                    "Vol ×avg": round(vol_ratio, 2) if vol_ratio is not None else None,
+                    "Today Vol": round(res["last_vol"]),
+                    "20d Avg Vol": round(res["avg_vol"]),
                     "Price": round(res["price"], 2),
                     "Resistance": round(res["resistance"], 2),
                     "Dist %": round(res["dist_pct"], 2),
@@ -1227,7 +1593,8 @@ else:
 
         table = pd.DataFrame(rows)
         # enforce a stable column order (Breakout? before Price; %s beside levels)
-        col_order = ["Ticker", "Score", "Signal", "Breakout?", "Price", "Resistance",
+        col_order = ["Ticker", "Score", "Signal", "Breakout?", "MY Base", "MY Dist %",
+                     "Vol ×avg", "Today Vol", "20d Avg Vol", "Price", "Resistance",
                      "Dist %", "Dist pts", "Entry", "Stop", "Stop %", "Target",
                      "Target %", "Base len", "Base depth %"]
         table = table.reindex(columns=[c for c in col_order if c in table.columns])
@@ -1251,6 +1618,10 @@ else:
                        f"the table below still reflects **{used}**. Click **Scan** again "
                        f"to recompute with the new method.")
         st.caption("👉 **Click a row** to load the full detailed analysis below.")
+        st.caption("**MY Base** = multi-year tested ceiling: 🏆 breakout / 🏅 long-base break / "
+                   "👀 testing / `N×` = touch count / `—` none. **MY Dist %** = distance to that "
+                   "ceiling (smaller = nearer; negative = already above). Sort by **MY Dist %** to "
+                   "find stocks closest to a multi-year breakout.")
 
         # tidy decimals everywhere; red Stop %, green Target %. Selection still works.
         fmt_map = {}
@@ -1258,18 +1629,29 @@ else:
             if c in table:
                 fmt_map[c] = "{:.2f}"
         for c, f in {"Dist %": "{:+.2f}%", "Stop %": "{:+.2f}%",
-                     "Target %": "{:+.2f}%", "Base depth %": "{:.1f}%"}.items():
+                     "Target %": "{:+.2f}%", "Base depth %": "{:.1f}%",
+                     "MY Dist %": "{:+.2f}%", "Vol ×avg": "{:.1f}×"}.items():
             if c in table:
                 fmt_map[c] = f
-        for c in ["Score", "Base len"]:
+        for c in ["Score", "Base len", "Today Vol", "20d Avg Vol"]:
             if c in table:
-                fmt_map[c] = "{:.0f}"
+                fmt_map[c] = "{:,.0f}"
+
+        thr = cfg.get("vol_surge_mult", 1.5)
+
+        def _vol_color(v):
+            try:
+                return "color: #2ecc71" if v >= thr else "color: #e0a800"
+            except Exception:
+                return ""
 
         styler = table.style
         if "Stop %" in table:
             styler = styler.set_properties(subset=["Stop %"], **{"color": "#e74c3c"})
         if "Target %" in table:
             styler = styler.set_properties(subset=["Target %"], **{"color": "#2ecc71"})
+        if "Vol ×avg" in table:
+            styler = styler.map(_vol_color, subset=["Vol ×avg"])
         if fmt_map:
             styler = styler.format(fmt_map, na_rep="—")
 
