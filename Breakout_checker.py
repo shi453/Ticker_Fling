@@ -9,7 +9,8 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Breakout Scanner Pro", layout="wide")
+st.set_page_config(page_title="Breakout Scanner Pro v3", layout="wide",
+                   initial_sidebar_state="collapsed")
 
 # =====================================================================
 # CONFIG  (defaults — most are overridable from the sidebar)
@@ -19,6 +20,7 @@ CONFIG = {
     "min_bars": 60,            # refuse to analyse a stock with fewer bars
     "chart_days": 252,         # how many trading days to draw on the chart
     "benchmark": "^NSEI",      # index used for Relative Strength (NIFTY 50)
+    "exchange": "Auto (NSE → BSE)",  # bare-symbol suffix policy (NSE/BSE support)
     # detection
     "box_method": "Pivot High",  # "Pivot High" (default) or "Darvas Box"
     "pivot_window": 3,         # bars on each side for a swing-high pivot
@@ -41,21 +43,45 @@ CONFIG = {
     "vol_surge_mult": 1.5,     # breakout volume must beat avg * this
     "rsi_low": 50,             # healthy momentum band
     "rsi_high": 70,            # above this = overbought
-    # scoring weights (editable in sidebar) — sum to 100
+    # quality filters (v2)
+    "close_loc_min": 0.7,      # breakout close must sit in the top 30% of the day's range
+    "min_turnover_cr": 1.0,    # min 20-day avg daily turnover (₹ crore); 0 = disabled
+    "near_hi52_pct": 25.0,     # "near 52-week high" = within X% of the 252-bar high
+    # scoring weights (editable in sidebar) — defaults sum to 100, but the
+    # score is normalized to /100 whatever they total
     "w_trend": 20,
     "w_near": 15,
-    "w_compression": 10,
+    "w_compression": 7,
     "w_volume_dry": 10,
     "w_higher_lows": 10,
-    "w_atr": 5,
+    "w_atr": 3,
     "w_touches": 10,
     "w_rsi": 5,
     "w_rel_strength": 5,
     "w_obv": 10,
+    "w_hi52": 5,
     # backtest
     "bt_threshold": 80,        # score needed to take a historical trade
     "bt_horizon": 20,          # bars to let a trade resolve
     "bt_lookback": 750,        # how far back to backtest (≈ 3 years)
+    "bt_regime": False,        # skip signals when benchmark < its 200-day EMA
+    # retest (v3) — "buy the pullback to the freshly broken level"
+    "rt_scanback": 40,         # bars to scan back for a fresh cross above resistance
+    "rt_band": 1.5,            # ±% around the level = the retest buy zone
+    "rt_fail_tol": 1.0,        # % close below the level that kills the setup
+    "rt_window": 20,           # bars after the breakout to wait for a retest
+    "rt_trigger_loc": 0.6,     # bounce bar must close in the top 40% of its range
+    "rt_rsi_low": 40,          # RSI "reset" band for the retest checklist
+    "rt_rsi_high": 55,
+    # retest scoring weights — normalized to /100 like the main score
+    "rw_trend": 20,
+    "rw_break_quality": 20,
+    "rw_pullback_vol": 15,
+    "rw_orderly": 15,
+    "rw_level_sig": 10,
+    "rw_rsi_reset": 5,
+    "rw_rel_strength": 10,
+    "rw_hi52": 5,
 }
 
 # Plain-English explanation for every checklist item.
@@ -89,6 +115,11 @@ EXPLANATIONS = {
                    "and prone to a pullback.",
     "Relative Strength": "The stock is outperforming the benchmark index over the "
                          "lookback window. Leaders break out first and run furthest.",
+    "Near 52-Week High": "The stock is trading close to its 52-week high. The "
+                         "'52-week-high momentum' effect is one of the most validated "
+                         "edges in breakout trading (core of the O'Neil/Minervini "
+                         "methods) — strength near highs tends to continue, and there "
+                         "is little overhead supply of trapped sellers.",
 }
 
 # Precise mechanics — "what exactly we check" for each checklist item.
@@ -114,7 +145,10 @@ METHODS = {
     "RSI Healthy": "Compute Wilder's RSI(14) on closing price. Pass if the latest "
                    "value sits inside the healthy band set in the sidebar.",
     "Relative Strength": "Compare the stock's 60-day % return against the benchmark's "
-                         "60-day % return. Pass if the stock's return is higher.",
+                         "60-day % return over the SAME dates (aligned to the stock's "
+                         "last bar — no look-ahead). Pass if the stock's return is higher.",
+    "Near 52-Week High": "Pass if the last Close is within the threshold % (default "
+                         "25%) of the highest High of the last 252 bars.",
 }
 
 # Definitions shown as the ⓘ tooltip next to each sidebar weight.
@@ -156,6 +190,76 @@ WEIGHT_HELP = {
     "w_rel_strength": "RELATIVE STRENGTH: Whether the stock is beating the market "
                       "index over the last 60 days. Market leaders break out first and "
                       "run furthest, so out-performance is a strong tailwind.",
+    "w_hi52": "NEAR 52-WEEK HIGH: Stocks near their 52-week high systematically "
+              "outperform — buyers are in control and there is little overhead supply "
+              "of trapped sellers waiting to exit at break-even. Measured as the "
+              "distance from the latest close to the 252-bar high.",
+}
+
+# ---------------------------------------------------------------------
+# Retest-mode (v3) checklist texts
+# ---------------------------------------------------------------------
+RT_EXPLANATIONS = {
+    "Trend Intact": "The EMA stack (price > EMA20 > EMA50 > EMA200) must still hold "
+                    "during the pullback. A dip that breaks the trend structure is a "
+                    "reversal, not a retest.",
+    "Breakout Quality": "The ORIGINAL break should have been volume-confirmed with a "
+                        "strong close. A 'retest' of a weak-volume break is usually "
+                        "just the failure playing out in slow motion.",
+    "Pullback Volume Dry-up": "Volume should SHRINK on the way back down to the level. "
+                              "Quiet sellers = a healthy retest; heavy volume into the "
+                              "level = distribution and a likely failure.",
+    "Orderly Pullback": "A healthy retest gives back only part of the breakout move "
+                        "(≤ ~65%) over a few bars. Fast, deep, sloppy pullbacks that "
+                        "slice straight back to the level fail more often.",
+    "Level Significance": "How many times the ceiling was tested BEFORE the break. "
+                          "A more-tested level attracts more support when revisited "
+                          "from above.",
+    "RSI Reset": "Momentum should have cooled into the reset band — cooled but not "
+                 "broken. RSI still >70 means it hasn't pulled back enough; well "
+                 "below 40 means the pullback may be turning into a decline.",
+    "Relative Strength": "The stock should still be beating the benchmark over 60 "
+                         "days (date-aligned). Leaders' retests get bought; laggards' "
+                         "retests get sold.",
+    "Near 52-Week High": "The 52-week-high momentum effect still applies — a retest "
+                         "near the highs has little overhead supply above it.",
+}
+
+RT_METHODS = {
+    "Trend Intact": "Pass if Close > EMA20 > EMA50 > EMA200 right now (same test as "
+                    "the breakout checklist's 'Trend').",
+    "Breakout Quality": "Pass if the breakout bar's volume was ≥ the surge multiple × "
+                        "its prior 20-day average AND its close-location cleared the "
+                        "threshold. Measured on the reconstructed breakout bar.",
+    "Pullback Volume Dry-up": "Pass if the mean volume of all bars since the "
+                              "post-breakout high is LOWER than the 20-day average "
+                              "volume before the breakout.",
+    "Orderly Pullback": "Pass if price has retraced ≤ 65% of the distance from the "
+                        "level to the post-breakout high, over at least 2 bars.",
+    "Level Significance": "Count highs within ±1% of the level over the 80 bars "
+                          "before the breakout. Pass if ≥ 3.",
+    "RSI Reset": "Pass if RSI(14) sits inside the reset band set in the sidebar "
+                 "(default 40–55).",
+    "Relative Strength": "Same date-aligned 60-day comparison as the breakout "
+                         "checklist.",
+    "Near 52-Week High": "Same test as the breakout checklist.",
+}
+
+RT_WEIGHT_HELP = {
+    "rw_trend": "TREND INTACT: the pullback must not break the EMA stack — otherwise "
+                "it's a reversal, not a retest.",
+    "rw_break_quality": "BREAKOUT QUALITY: retests of strong (volume-confirmed, "
+                        "strong-close) breaks succeed far more often than retests of "
+                        "weak drifts over the line.",
+    "rw_pullback_vol": "PULLBACK VOLUME: quiet pullbacks = holders sitting tight; "
+                       "loud pullbacks = distribution.",
+    "rw_orderly": "ORDERLY PULLBACK: shallow, multi-bar retracements hold; instant "
+                  "round-trips to the level usually fail.",
+    "rw_level_sig": "LEVEL SIGNIFICANCE: a many-times-tested ceiling becomes strong "
+                    "support once broken.",
+    "rw_rsi_reset": "RSI RESET: momentum cooled but not broken (default 40–55).",
+    "rw_rel_strength": "RELATIVE STRENGTH: leaders' retests get bought.",
+    "rw_hi52": "NEAR 52-WEEK HIGH: little overhead supply above the retest.",
 }
 
 
@@ -164,13 +268,15 @@ WEIGHT_HELP = {
 # =====================================================================
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_history(ticker):
-    """Full daily history. Retries on transient failures (Yahoo throttles shared
-    cloud IPs harder), and returns an empty DataFrame if it ultimately fails."""
+    """Full daily history. Prices are split/dividend-ADJUSTED (auto_adjust=True)
+    so multi-year levels stay comparable across splits and bonuses — essential
+    for the long-base detection and the backtest. Retries on transient failures
+    (Yahoo throttles shared cloud IPs harder); empty DataFrame on failure."""
     for attempt in range(3):
         try:
             df = yf.download(
                 ticker, period="max", interval="1d",
-                auto_adjust=False, progress=False,
+                auto_adjust=True, progress=False,
             )
             if df is not None and not df.empty:
                 # Flatten the MultiIndex yfinance returns for single tickers.
@@ -194,14 +300,29 @@ def load_info(ticker):
         return {}
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def benchmark_return(symbol, days):
-    """Percentage return of the benchmark over `days` trading days."""
-    hist = load_history(symbol)
-    if hist.empty or len(hist) < days:
+@st.cache_data(show_spinner=False, ttl=21600)
+def next_earnings_date(ticker):
+    """Next scheduled earnings date (best-effort — Yahoo's calendar is flaky).
+    Returns a pandas Timestamp or None."""
+    try:
+        cal = yf.Ticker(ticker).calendar
+        dates = None
+        if isinstance(cal, dict):
+            dates = cal.get("Earnings Date") or cal.get("EarningsDate")
+        elif cal is not None and hasattr(cal, "loc"):    # older DataFrame form
+            try:
+                dates = list(cal.loc["Earnings Date"])
+            except Exception:
+                dates = None
+        if dates is None:
+            return None
+        if not isinstance(dates, (list, tuple)):
+            dates = [dates]
+        today = pd.Timestamp.today().normalize()
+        future = sorted(pd.Timestamp(d) for d in dates if pd.Timestamp(d) >= today)
+        return future[0] if future else None
+    except Exception:
         return None
-    close = hist["Close"]
-    return (close.iloc[-1] - close.iloc[-days]) / close.iloc[-days] * 100
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -270,12 +391,30 @@ def fmt(x, nd=2):
     return "N/A" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:,.{nd}f}"
 
 
-def normalize_ticker(t):
-    """Auto-append '.NS' (NSE) for bare symbols. Leaves indices (^...) and
-    symbols that already carry an exchange suffix (with a '.') untouched."""
+def normalize_ticker(t, exchange="Auto (NSE → BSE)"):
+    """Syntactic normalisation: bare symbols get the preferred exchange suffix
+    ('.BO' when the preference is BSE, else '.NS' — Auto also starts with NSE
+    and relies on analyze()'s twin-fallback for BSE-only names). Indices (^...)
+    and symbols that already carry a suffix pass through untouched."""
     t = (t or "").strip().upper()
     if not t or t.startswith("^") or "." in t:
         return t
+    return t + (".BO" if str(exchange).startswith("BSE") else ".NS")
+
+
+def resolve_ticker(t, exchange="Auto (NSE → BSE)"):
+    """Data-checked resolution for bare symbols: in Auto mode, try NSE then BSE
+    and return the first listing that actually has history (the download is
+    cached, so the analysis reuses it). Used where the symbol is STORED
+    (watchlist) so scans don't have to re-resolve it every time."""
+    t = (t or "").strip().upper()
+    if not t or t.startswith("^") or "." in t:
+        return t
+    if not str(exchange).startswith("Auto"):
+        return normalize_ticker(t, exchange)
+    for suf in (".NS", ".BO"):
+        if not load_history(t + suf).empty:
+            return t + suf
     return t + ".NS"
 
 
@@ -473,7 +612,7 @@ def long_base(df, lookback=None, window=None, tol=None, min_touches=None,
         "dist_pct": (level - last_close) / level * 100,
         "broke": last_close > level,
         "last_vol": float(sub["Volume"].iloc[-1]),
-        "avg_vol": float(sub["Volume"].tail(20).mean()),
+        "avg_vol": float(sub["Volume"].iloc[-21:-1].mean()),   # exclude today
         "touch_dates": [idx[q] for q in touch_pos],
         "touch_prices": [float(highs[q]) for q in touch_pos],
     }
@@ -553,26 +692,224 @@ def check_rsi(df, lo, hi):
     return ok, detail, rsi
 
 
-def check_relative_strength(df, days=60):
-    bench = benchmark_return(CONFIG["benchmark"], days)
-    if bench is None or len(df) < days:
+def check_relative_strength(df, benchmark, days=60):
+    """Stock vs benchmark return, DATE-ALIGNED to the stock's last bar — the
+    backtest therefore sees the benchmark exactly as it stood on each historical
+    signal date (no look-ahead)."""
+    hist = load_history(benchmark)
+    if hist.empty or len(df) < days + 1:
         return False, "Benchmark data unavailable", None
-    stock = (df["Close"].iloc[-1] - df["Close"].iloc[-days]) / df["Close"].iloc[-days] * 100
+    bench_close = hist["Close"].loc[:df.index[-1]]
+    if len(bench_close) < days + 1:
+        return False, "Benchmark data unavailable", None
+    stock = (df["Close"].iloc[-1] / df["Close"].iloc[-days - 1] - 1) * 100
+    bench = (bench_close.iloc[-1] / bench_close.iloc[-days - 1] - 1) * 100
     ok = stock > bench
-    detail = f"Stock {stock:+.1f}% vs {CONFIG['benchmark']} {bench:+.1f}% (60d)"
+    detail = f"Stock {stock:+.1f}% vs {benchmark} {bench:+.1f}% ({days}d)"
     return ok, detail, stock - bench
+
+
+def check_near_high52(df, within_pct):
+    close = df["Close"].iloc[-1]
+    hi52 = float(df["High"].tail(252).max())
+    dist = (hi52 - close) / hi52 * 100
+    ok = dist <= within_pct
+    detail = f"{dist:.1f}% below 52-wk high {hi52:.2f} (need ≤ {within_pct:g}%)"
+    return ok, detail
+
+
+# =====================================================================
+# RETEST ENGINE (v3) — "buy the pullback to the freshly broken level"
+# =====================================================================
+def find_recent_breakout(df, cfg):
+    """
+    Find the most recent DECISIVE CROSS above the as-of resistance within the
+    last `rt_scanback` bars.
+
+    Statelessness: the level is computed ONLY from data BEFORE the cross bar
+    (`work.iloc[:j]`), so re-running this days later replays the identical
+    slice of immutable history and returns the identical FROZEN level — no
+    storage needed, and the level can never drift to the post-breakout high.
+    Returns None if there is no fresh cross.
+    """
+    scanback = int(cfg.get("rt_scanback", 40))
+    lookback = int(cfg.get("res_lookback", CONFIG["res_lookback"]))
+    darvas = cfg.get("box_method") == "Darvas Box"
+    # bounded tail: enough history for the level engines + the scan window
+    work = df.tail(lookback + scanback + 10)
+    m = len(work)
+    offset = len(df) - m
+    start = max(30, m - scanback)
+    for j in range(m - 1, start - 1, -1):        # newest cross first
+        sub = work.iloc[:j]                       # data BEFORE bar j only
+        if len(sub) < 30:
+            break
+        level = darvas_box(sub)["top"] if darvas else find_resistance(sub)
+        prev_close = float(work["Close"].iloc[j - 1])
+        close_j = float(work["Close"].iloc[j])
+        if not (prev_close <= level < close_j):
+            continue
+        # quality of the breakout bar (avg volume EXCLUDES the bar itself)
+        avg_vol = float(work["Volume"].iloc[max(0, j - 20):j].mean())
+        vol_j = float(work["Volume"].iloc[j])
+        hi_j, lo_j = float(work["High"].iloc[j]), float(work["Low"].iloc[j])
+        rng = hi_j - lo_j
+        close_loc = (close_j - lo_j) / rng if rng > 0 else 1.0
+        vol_ratio = vol_j / avg_vol if avg_vol else 0.0
+        return {
+            "level": float(level),
+            "pos": offset + j,                    # position in the FULL df
+            "date": work.index[j],
+            "bars_ago": int(m - 1 - j),
+            "vol_ratio": float(vol_ratio),
+            "close_loc": float(close_loc),
+            "confirmed": bool(vol_ratio >= cfg["vol_surge_mult"]
+                              and close_loc >= cfg["close_loc_min"]),
+        }
+    return None
+
+
+def retest_state(df, bo, cfg):
+    """
+    Classify everything AFTER the breakout bar against the FROZEN level:
+      extended → pulling_back → at_retest → triggered   (the happy path)
+      failed   = a close below level×(1−fail_tol): the breakout is dead
+      ran_away = never touched the zone within `rt_window` bars
+    """
+    level = bo["level"]
+    band = cfg.get("rt_band", 1.5) / 100
+    fail_tol = cfg.get("rt_fail_tol", 1.0) / 100
+    window = int(cfg.get("rt_window", 20))
+    trig_loc = cfg.get("rt_trigger_loc", 0.6)
+
+    zone_hi, zone_lo = level * (1 + band), level * (1 - band)
+    fail_lvl = level * (1 - fail_tol)
+
+    post = df.iloc[bo["pos"]:]                    # breakout bar onward
+    after = df.iloc[bo["pos"] + 1:]               # strictly after it
+    ext_high = float(post["High"].max())
+    ext_pos = bo["pos"] + int(post["High"].values.argmax())
+    cur = float(df["Close"].iloc[-1])
+    lo_now, hi_now = float(df["Low"].iloc[-1]), float(df["High"].iloc[-1])
+    dist_pct = (cur - level) / level * 100
+
+    failed = bool(len(after) and (after["Close"] < fail_lvl).any())
+    touched = bool(len(after) and (after["Low"] <= zone_hi).any())
+    in_zone = lo_now <= zone_hi and cur >= fail_lvl
+    rng_now = hi_now - lo_now
+    loc_now = (cur - lo_now) / rng_now if rng_now > 0 else 1.0
+
+    if failed:
+        state = "failed"
+    elif in_zone and cur >= zone_lo and loc_now >= trig_loc:
+        state = "triggered"
+    elif in_zone:
+        state = "at_retest"
+    elif not touched and bo["bars_ago"] > window:
+        state = "ran_away"
+    elif dist_pct <= 2 * band * 100:
+        state = "pulling_back"
+    else:
+        state = "extended"
+
+    # pullback character (measured from the post-breakout extension high)
+    pull = df.iloc[ext_pos + 1:]
+    pullback_bars = len(pull)
+    retrace = ((ext_high - cur) / (ext_high - level)
+               if ext_high > level and cur < ext_high else 0.0)
+    pre_avg_vol = float(df["Volume"].iloc[max(0, bo["pos"] - 20):bo["pos"]].mean())
+    pull_vol_ratio = (float(pull["Volume"].mean()) / pre_avg_vol
+                      if pullback_bars and pre_avg_vol else None)
+    retest_low = float(after["Low"].min()) if len(after) else None
+
+    return {"state": state, "level": level, "zone_lo": zone_lo, "zone_hi": zone_hi,
+            "fail_lvl": fail_lvl, "ext_high": ext_high, "dist_pct": dist_pct,
+            "retrace": retrace, "pullback_bars": pullback_bars,
+            "pull_vol_ratio": pull_vol_ratio, "retest_low": retest_low,
+            "touched": touched, "close_loc_now": loc_now}
+
+
+def retest_score(df, bo, rst, cfg):
+    """Retest checklist -> (normalized score /100, checklist dict)."""
+    checklist = {}
+
+    def add(name, ok, detail, weight):
+        checklist[name] = {
+            "passed": bool(ok), "detail": detail,
+            "points": weight if ok else 0, "max": weight,
+            "explanation": RT_EXPLANATIONS.get(name, ""),
+            "method": RT_METHODS.get(name, ""),
+        }
+
+    ok, d = check_trend(df)
+    add("Trend Intact", ok, d, cfg["rw_trend"])
+
+    d = (f"broke on {bo['vol_ratio']:.1f}× volume, close-loc {bo['close_loc']:.2f} "
+         f"({bo['date']:%d %b %Y})")
+    add("Breakout Quality", bo["confirmed"], d, cfg["rw_break_quality"])
+
+    pv = rst["pull_vol_ratio"]
+    ok = pv is not None and pv < 1.0
+    d = (f"pullback volume {pv:.2f}× the pre-break average" if pv is not None
+         else "no pullback yet")
+    add("Pullback Volume Dry-up", ok, d, cfg["rw_pullback_vol"])
+
+    ok = 0 < rst["retrace"] <= 0.65 and rst["pullback_bars"] >= 2
+    d = (f"retraced {rst['retrace'] * 100:.0f}% of the post-break move over "
+         f"{rst['pullback_bars']} bar(s)")
+    add("Orderly Pullback", ok, d, cfg["rw_orderly"])
+
+    touches = count_resistance_touches(df.iloc[:bo["pos"]], bo["level"])
+    add("Level Significance", touches >= 3,
+        f"{touches} touch(es) of the level before the break", cfg["rw_level_sig"])
+
+    rsi = float(df["RSI"].iloc[-1])
+    lo, hi = cfg["rt_rsi_low"], cfg["rt_rsi_high"]
+    add("RSI Reset", lo <= rsi <= hi,
+        f"RSI(14) = {rsi:.1f} (reset band {lo}-{hi})", cfg["rw_rsi_reset"])
+
+    ok, d, _ = check_relative_strength(df, cfg["benchmark"])
+    add("Relative Strength", ok, d, cfg["rw_rel_strength"])
+    ok, d = check_near_high52(df, cfg["near_hi52_pct"])
+    add("Near 52-Week High", ok, d, cfg["rw_hi52"])
+
+    raw = sum(i["points"] for i in checklist.values())
+    mx = sum(i["max"] for i in checklist.values())
+    return (round(raw / mx * 100) if mx else 0), checklist
+
+
+def retest_trade_plan(df, bo, rst, cfg):
+    """Entry at the level (or today's close if triggered), STRUCTURAL stop just
+    below the retest low / buy zone, targets at the post-breakout high and 2R."""
+    level = bo["level"]
+    cur = float(df["Close"].iloc[-1])
+    entry = cur if rst["state"] == "triggered" else level * 1.002
+    base = (rst["retest_low"] if rst["touched"] and rst["retest_low"] is not None
+            else rst["zone_lo"])
+    stop = min(base, level) * 0.997
+    risk = entry - stop
+    t1 = rst["ext_high"] if rst["ext_high"] > entry * 1.01 else None
+    t2 = entry + 2 * risk if risk > 0 else None
+    rr1 = (t1 - entry) / risk if (t1 and risk > 0) else None
+    return {"entry": entry, "stop": stop, "risk": risk,
+            "t1": t1, "t2": t2, "rr1": rr1, "cur": cur}
 
 
 # =====================================================================
 # BREAKOUT CONFIRMATION  (has it *already* broken out today?)
 # =====================================================================
-def breakout_confirmed(df, resistance, vol_mult):
+def breakout_confirmed(df, resistance, vol_mult, close_loc_min=0.0):
     last_close = df["Close"].iloc[-1]
     last_vol = df["Volume"].iloc[-1]
-    avg_vol = df["Volume"].tail(20).mean()
+    avg_vol = df["Volume"].iloc[-21:-1].mean()   # exclude the breakout day itself
     above = last_close > resistance
     vol_ok = last_vol > avg_vol * vol_mult
-    return above and vol_ok, above, vol_ok, last_vol, avg_vol
+    # close location: where in the day's range did we close? (1.0 = at the high).
+    # A high-volume break that closes mid/low-range is usually a REJECTION.
+    day_rng = df["High"].iloc[-1] - df["Low"].iloc[-1]
+    close_loc = float((last_close - df["Low"].iloc[-1]) / day_rng) if day_rng > 0 else 1.0
+    loc_ok = close_loc >= close_loc_min
+    return above and vol_ok and loc_ok, above, vol_ok, last_vol, avg_vol, close_loc, loc_ok
 
 
 # =====================================================================
@@ -606,18 +943,25 @@ def calculate_score(df, resistance, cfg):
         f"{touches} touch(es) within ±{CONFIG['touch_tolerance']*100:.0f}%", cfg["w_touches"])
 
     ok, d, _ = check_rsi(df, cfg["rsi_low"], cfg["rsi_high"]); add("RSI Healthy", ok, d, cfg["w_rsi"])
-    ok, d, _ = check_relative_strength(df);        add("Relative Strength", ok, d, cfg["w_rel_strength"])
+    ok, d, _ = check_relative_strength(df, cfg["benchmark"])
+    add("Relative Strength", ok, d, cfg["w_rel_strength"])
+    ok, d = check_near_high52(df, cfg["near_hi52_pct"])
+    add("Near 52-Week High", ok, d, cfg["w_hi52"])
 
-    score = sum(item["points"] for item in checklist.values())
+    # normalize to /100 so custom weight totals can't silently break the
+    # 80/65 signal bands
+    raw = sum(item["points"] for item in checklist.values())
+    max_total = sum(item["max"] for item in checklist.values())
+    score = round(raw / max_total * 100) if max_total else 0
     return score, checklist, dist_pct, dist_pts, touches
 
 
 # =====================================================================
 # TRADE PLANNER
 # =====================================================================
-def trade_levels(df, resistance, structural_stop=None):
-    price = df["Close"].iloc[-1]
-    atr = df["ATR14"].iloc[-1]
+def breakout_trade_math(resistance, atr, structural_stop=None):
+    """Entry/stop/target used by BOTH the live plan and the backtest — one
+    definition so the two can never drift apart."""
     entry = resistance * 1.002              # trigger just above resistance
     if structural_stop is not None and structural_stop < entry:
         stop = structural_stop * 0.997     # Darvas: just below the box floor
@@ -625,8 +969,27 @@ def trade_levels(df, resistance, structural_stop=None):
         stop = entry - 1.5 * atr           # volatility-based stop
     risk = entry - stop
     target = entry + 2 * risk               # 2R target
+    return entry, stop, target, risk
+
+
+def trade_levels(df, resistance, structural_stop=None):
+    price = df["Close"].iloc[-1]
+    atr = df["ATR14"].iloc[-1]
+    entry, stop, target, risk = breakout_trade_math(resistance, atr, structural_stop)
     rr = (target - entry) / risk if risk else 0
     return price, entry, stop, target, atr, risk, rr
+
+
+def overhead_target(df, ref, lookback=750, window=5, tol=0.02):
+    """Nearest prior swing-high meaningfully above `ref` — the first place
+    sellers showed up before (a natural partial-profit spot). None if price is
+    in blue-sky territory (no overhead resistance)."""
+    h = df.tail(lookback)["High"].values
+    piv = [float(h[i]) for i in range(window, len(h) - window)
+           if h[i] >= h[i - window:i].max()
+           and h[i] >= h[i + 1:i + window + 1].max()
+           and h[i] > ref * (1 + tol)]
+    return min(piv) if piv else None
 
 
 def get_signal(score):
@@ -640,22 +1003,65 @@ def get_signal(score):
 # =====================================================================
 # BACKTEST  (does a high score actually win historically?)
 # =====================================================================
-def backtest(df, cfg):
-    """
-    Walk history bar-by-bar. Whenever the as-of score >= threshold AND a
-    volume-confirmed breakout fires, simulate a trade (entry = resistance*1.002,
-    stop = entry - 1.5*ATR, target = entry + 2*risk) and see whether target or
-    stop is hit first within `horizon` bars. Non-overlapping trades only.
-
-    NOTE: this reuses the live scoring. The Relative-Strength component uses the
-    *current* benchmark return, so it carries minor look-ahead; treat the win-rate
-    as indicative, not exact.
-    """
-    threshold = cfg["bt_threshold"]
-    horizon = cfg["bt_horizon"]
-    data = df.tail(cfg["bt_lookback"]).reset_index(drop=True)
+def _simulate_trade(data, entry_j, fill, stop, horizon):
+    """Shared exit engine used by BOTH entry policies: from the fill bar onward,
+    race the stop against a 2R target. Gaps exit at the open (losses can exceed
+    1R, wins can exceed 2R); stop is checked before target on the same bar
+    (conservative); a timeout marks to the last close.
+    Returns (outcome, exit_i, r_mult)."""
     n = len(data)
+    risk = fill - stop
+    target = fill + 2 * risk
+    for j in range(entry_j, min(entry_j + horizon, n)):
+        op = float(data["Open"].iloc[j])
+        lo, hi = data["Low"].iloc[j], data["High"].iloc[j]
+        if j > entry_j and op <= stop:              # gapped through the stop
+            return "loss", j, (op - fill) / risk
+        if lo <= stop:                              # stop first = conservative
+            return "loss", j, (stop - fill) / risk
+        if hi >= target:                            # gap above target exits at open
+            return "win", j, (max(target, op) - fill) / risk
+    exit_i = min(entry_j + horizon - 1, n - 1)      # timed out — mark to last close
+    return "timeout", exit_i, (float(data["Close"].iloc[exit_i]) - fill) / risk
+
+
+def backtest(df, cfg, policy="breakout", threshold=None):
+    """
+    Walk history bar-by-bar. A SIGNAL fires whenever the as-of score >= threshold
+    AND a confirmed breakout occurs (volume surge + close-location — same rules
+    as the live scanner). The same signals are then traded via one of two entry
+    policies:
+
+      • policy="breakout": fill at the NEXT bar's open (you can't fill at a
+        level the signal bar already traded through).
+      • policy="retest"  : wait up to `rt_window` bars for a pullback into the
+        retest zone (level ± rt_band). A strong-close bounce bar triggers the
+        entry at the following open, with a structural stop below the retest
+        low. Signals whose price closes below level×(1−rt_fail_tol) first are
+        AVOIDED (a failed break the policy dodged); signals that never pull
+        back are MISSED.
+
+    Both policies share the same exit engine (_simulate_trade). Timed-out
+    trades count toward expectancy but are excluded from the win rate.
+    `r_per_signal` spreads total R across ALL signals (missed/avoided = 0R) —
+    the fair way to compare the two policies.
+
+    Optional regime filter: skip signals fired while the benchmark closed below
+    its own 200-day EMA as of the signal date (date-aligned — no look-ahead).
+    Non-overlapping trades only.
+    """
+    threshold = cfg["bt_threshold"] if threshold is None else threshold
+    horizon = cfg["bt_horizon"]
+    data = df.tail(cfg["bt_lookback"])      # keep the DatetimeIndex — RS and the
+    n = len(data)                           # regime filter align by date
     trades = []
+    signals = missed = avoided = 0
+
+    regime_ok = None
+    if cfg.get("bt_regime"):
+        bh = load_history(cfg["benchmark"])
+        if not bh.empty:
+            regime_ok = bh["Close"] > bh["Close"].ewm(span=200, adjust=False).mean()
 
     darvas = cfg.get("box_method") == "Darvas Box"
     i = cfg["min_bars"]
@@ -667,54 +1073,94 @@ def backtest(df, cfg):
         else:
             res, sstop = find_resistance(sub), None
         score = calculate_score(sub, res, cfg)[0]
-        confirmed = breakout_confirmed(sub, res, cfg["vol_surge_mult"])[0]
+        confirmed = breakout_confirmed(sub, res, cfg["vol_surge_mult"],
+                                       cfg.get("close_loc_min", 0.0))[0]
 
-        if score >= threshold and confirmed:
-            atr = sub["ATR14"].iloc[-1]
-            entry = res * 1.002
-            if sstop is not None and sstop < entry:
-                stop = sstop * 0.997
-            else:
-                stop = entry - 1.5 * atr
-            risk = entry - stop
-            target = entry + 2 * risk
-
-            outcome, exit_i = None, None
-            if risk > 0:
-                for j in range(i + 1, min(i + 1 + horizon, n)):
-                    lo, hi = data["Low"].iloc[j], data["High"].iloc[j]
-                    if lo <= stop:                 # stop checked first = conservative
-                        outcome, exit_i = "loss", j
-                        break
-                    if hi >= target:
-                        outcome, exit_i = "win", j
-                        break
-            if outcome is None:                    # timed out — mark to last close
-                exit_i = min(i + horizon, n - 1)
-                last = data["Close"].iloc[exit_i]
-                r_mult = (last - entry) / risk if risk else 0
-                outcome = "win" if r_mult > 0 else "loss"
-                trades.append({"r": r_mult, "outcome": outcome, "bars": exit_i - i})
-            else:
-                trades.append({"r": 2.0 if outcome == "win" else -1.0,
-                               "outcome": outcome, "bars": exit_i - i})
-            i = exit_i + 1                          # no overlapping trades
-        else:
+        if not (score >= threshold and confirmed):
             i += 1
+            continue
+        if regime_ok is not None:
+            r_asof = regime_ok.loc[:sub.index[-1]]
+            if r_asof.empty or not bool(r_asof.iloc[-1]):
+                i += 1                              # risk-off on signal date: skip
+                continue
+        signals += 1
+
+        if policy == "breakout":
+            atr = sub["ATR14"].iloc[-1]
+            if pd.isna(atr):
+                i += 1
+                continue
+            _, stop, _, _ = breakout_trade_math(res, atr, sstop)
+            fill = float(data["Open"].iloc[i + 1])  # realistic fill: next bar's open
+            if fill - stop <= 0:                    # opened at/below the stop: no trade
+                i += 1
+                continue
+            outcome, exit_i, r_mult = _simulate_trade(data, i + 1, fill, stop, horizon)
+            trades.append({"r": r_mult, "outcome": outcome, "bars": exit_i - i,
+                           "score": score})
+            i = exit_i + 1                          # no overlapping trades
+        else:                                       # ---- retest entry policy ----
+            band = cfg.get("rt_band", 1.5) / 100
+            fail_tol = cfg.get("rt_fail_tol", 1.0) / 100
+            window = int(cfg.get("rt_window", 20))
+            trig_loc = cfg.get("rt_trigger_loc", 0.6)
+            zone_hi, zone_lo = res * (1 + band), res * (1 - band)
+            fail_lvl = res * (1 - fail_tol)
+            trig_k, fate, k = None, "missed", i
+            for k in range(i + 1, min(i + 1 + window, n - 1)):
+                c_k = float(data["Close"].iloc[k])
+                l_k = float(data["Low"].iloc[k])
+                h_k = float(data["High"].iloc[k])
+                if c_k < fail_lvl:                  # failed before triggering: dodged
+                    fate = "avoided"
+                    break
+                if l_k <= zone_hi:                  # touched the retest zone
+                    rng = h_k - l_k
+                    loc = (c_k - l_k) / rng if rng > 0 else 1.0
+                    if c_k >= zone_lo and loc >= trig_loc:
+                        trig_k, fate = k, "trade"   # bounce bar: enter next open
+                        break
+            if fate == "trade":
+                retest_low = float(data["Low"].iloc[i + 1:trig_k + 1].min())
+                stop = min(retest_low, fail_lvl) * 0.997
+                fill = float(data["Open"].iloc[trig_k + 1])
+                if fill - stop <= 0:
+                    missed += 1
+                    i = trig_k + 1
+                    continue
+                outcome, exit_i, r_mult = _simulate_trade(
+                    data, trig_k + 1, fill, stop, horizon)
+                trades.append({"r": r_mult, "outcome": outcome, "bars": exit_i - i,
+                           "score": score})
+                i = exit_i + 1
+            elif fate == "avoided":
+                avoided += 1
+                i = k + 1
+            else:
+                missed += 1
+                i = max(k + 1, i + 1)
 
     total = len(trades)
+    total_r = sum(t["r"] for t in trades)
+    out = {"trades": total, "signals": signals, "missed": missed,
+           "avoided": avoided, "policy": policy, "span_bars": n,
+           "r_per_signal": total_r / signals if signals else 0.0,
+           "trades_detail": trades}     # per-trade r/outcome/score (calibration)
     if total == 0:
-        return {"trades": 0}
+        return out
     wins = sum(1 for t in trades if t["outcome"] == "win")
-    win_rate = wins / total * 100
-    avg_r = sum(t["r"] for t in trades) / total
-    avg_hold = sum(t["bars"] for t in trades) / total
-    return {
-        "trades": total, "wins": wins, "losses": total - wins,
-        "win_rate": win_rate, "avg_r": avg_r, "avg_hold": avg_hold,
-        "expectancy": avg_r,           # R per trade
-        "span_bars": n,
-    }
+    losses = sum(1 for t in trades if t["outcome"] == "loss")
+    timeouts = total - wins - losses
+    resolved = wins + losses
+    out.update({
+        "wins": wins, "losses": losses, "timeouts": timeouts,
+        "win_rate": wins / resolved * 100 if resolved else 0.0,
+        "avg_r": total_r / total,
+        "expectancy": total_r / total,   # R per trade (timeouts included)
+        "avg_hold": sum(t["bars"] for t in trades) / total,
+    })
+    return out
 
 
 # =====================================================================
@@ -768,8 +1214,17 @@ def build_stats(df, info):
 # =====================================================================
 def analyze(ticker, cfg):
     raw = load_history(ticker)
+    if raw.empty and str(cfg.get("exchange", "Auto")).startswith("Auto"):
+        # exchange-twin fallback: most Indian stocks list on both NSE and BSE,
+        # some only on one — swap the suffix and retry before giving up
+        alt = (ticker[:-3] + ".BO" if ticker.endswith(".NS")
+               else ticker[:-3] + ".NS" if ticker.endswith(".BO") else None)
+        if alt:
+            raw_alt = load_history(alt)
+            if not raw_alt.empty:
+                raw, ticker = raw_alt, alt
     if raw.empty:
-        return {"error": "No data found"}
+        return {"error": "No data found (NSE and BSE twins both checked)"}
     if len(raw) < cfg["min_bars"]:
         return {"error": f"Only {len(raw)} bars — need >= {cfg['min_bars']}"}
 
@@ -787,9 +1242,14 @@ def analyze(ticker, cfg):
 
     score, checklist, dist_pct, dist_pts, touches = calculate_score(df, resistance, cfg)
     price, entry, stop, target, atr, risk, rr = trade_levels(df, resistance, structural_stop)
-    confirmed, above, vol_ok, last_vol, avg_vol = breakout_confirmed(
-        df, resistance, cfg["vol_surge_mult"])
+    t1_struct = overhead_target(df, entry)     # nearest overhead resistance (Target 1)
+    confirmed, above, vol_ok, last_vol, avg_vol, close_loc, loc_ok = breakout_confirmed(
+        df, resistance, cfg["vol_surge_mult"], cfg["close_loc_min"])
     base_len, base_depth, base_low = base_metrics(df, resistance)
+
+    # liquidity: 20-day average traded value (price × volume), in ₹ crore
+    turnover_cr = float((df["Close"] * df["Volume"]).tail(20).mean()) / 1e7
+    liquid = cfg["min_turnover_cr"] <= 0 or turnover_cr >= cfg["min_turnover_cr"]
 
     # long-tested horizontal ceiling ("multi-year base") — display/badge only
     lb = long_base(df, cfg.get("lb_lookback"), cfg.get("lb_window"),
@@ -815,16 +1275,30 @@ def analyze(ticker, cfg):
         else:
             lb["state"] = "none"
 
+    # retest (v3): reconstruct the most recent breakout with a FROZEN level
+    rt = None
+    bo = find_recent_breakout(df, cfg)
+    if bo:
+        rst = retest_state(df, bo, cfg)
+        rt_scr, rt_chk = retest_score(df, bo, rst, cfg)
+        rt = {"bo": bo, "st": rst, "score": rt_scr, "checklist": rt_chk,
+              "plan": retest_trade_plan(df, bo, rst, cfg)}
+
     return {
+        "ticker": ticker,       # may differ from the input after a twin fallback
         "df": df, "resistance": resistance, "score": score, "checklist": checklist,
         "dist_pct": dist_pct, "dist_pts": dist_pts, "touches": touches,
         "price": price, "entry": entry, "stop": stop, "target": target,
+        "t1_struct": t1_struct,
         "atr": atr, "risk": risk, "rr": rr,
         "signal": get_signal(score), "confirmed": confirmed,
         "above": above, "vol_ok": vol_ok, "last_vol": last_vol, "avg_vol": avg_vol,
+        "close_loc": close_loc, "loc_ok": loc_ok,
+        "turnover_cr": turnover_cr, "liquid": liquid,
         "base_len": base_len, "base_depth": base_depth, "base_low": base_low,
         "box": box, "box_method": cfg.get("box_method", "Pivot High"),
         "long_base": lb,
+        "retest": rt,
     }
 
 
@@ -842,17 +1316,35 @@ if st.sidebar.button("🔄 Clear cache & refresh data", use_container_width=True
 
 cfg = dict(CONFIG)
 
-cfg["benchmark"] = st.sidebar.text_input("Benchmark (Relative Strength)", CONFIG["benchmark"])
-CONFIG["benchmark"] = cfg["benchmark"]
-cfg["box_method"] = st.sidebar.selectbox(
-    "Box / resistance method", ["Pivot High", "Darvas Box"],
-    help="Pivot High (default) = swing-high resistance. Darvas Box = the box top "
-         "(ceiling) is the breakout trigger and the box floor is a structural stop. "
-         "Switch and re-run the backtest to compare which works better for a stock.")
+cfg["benchmark"] = st.sidebar.text_input(
+    "Benchmark (Relative Strength)", CONFIG["benchmark"]).strip().upper()
+cfg["exchange"] = st.sidebar.selectbox(
+    "Exchange for bare symbols", ["Auto (NSE → BSE)", "NSE (.NS)", "BSE (.BO)"],
+    help="What to do when a symbol has no suffix (e.g. 'TCS'). Auto tries NSE "
+         "first and falls back to BSE when NSE has no data — dual-listed stocks "
+         "usually trade far more volume on NSE, so NSE data gives better signals. "
+         "Explicit suffixes always win (.NS = NSE, .BO = BSE, e.g. 500325.BO). "
+         "For a BSE benchmark use ^BSESN (SENSEX).")
 cfg["near_pct"] = st.sidebar.slider("Near-resistance threshold (%)", 1.0, 10.0, CONFIG["near_pct"], 0.5)
 cfg["vol_surge_mult"] = st.sidebar.slider("Breakout volume surge (×avg)", 1.0, 3.0, CONFIG["vol_surge_mult"], 0.1)
 c_lo, c_hi = st.sidebar.slider("Healthy RSI band", 0, 100, (CONFIG["rsi_low"], CONFIG["rsi_high"]))
 cfg["rsi_low"], cfg["rsi_high"] = c_lo, c_hi
+
+with st.sidebar.expander("Quality filters"):
+    cfg["close_loc_min"] = st.slider(
+        "Breakout close location (min)", 0.0, 0.9, CONFIG["close_loc_min"], 0.05,
+        help="Where in the day's range the breakout must CLOSE (1.0 = at the high). "
+             "0.7 = top 30% of the range. A high-volume break that closes mid/low "
+             "range is usually a rejection, not a breakout. Set 0 to disable.")
+    cfg["min_turnover_cr"] = st.number_input(
+        "Min avg daily turnover (₹ Cr, 0 = off)", 0.0, 500.0,
+        CONFIG["min_turnover_cr"], 0.5,
+        help="20-day average of price × volume. Illiquid stocks produce clean-looking "
+             "coils that are just wide spreads — breakout trading needs real liquidity.")
+    cfg["near_hi52_pct"] = st.slider(
+        "'Near 52-wk high' threshold (%)", 5.0, 50.0, CONFIG["near_hi52_pct"], 5.0,
+        help="The 'Near 52-Week High' checklist item passes when price is within "
+             "this % of its 252-bar high (Minervini uses ≤25%).")
 
 with st.sidebar.expander("Scoring weights (sum should = 100)"):
     for key, label in [
@@ -861,12 +1353,13 @@ with st.sidebar.expander("Scoring weights (sum should = 100)"):
         ("w_obv", "Volume Accumulation (OBV)"),
         ("w_higher_lows", "Higher Lows"), ("w_atr", "ATR Compression"),
         ("w_touches", "Resistance Touches"), ("w_rsi", "RSI Healthy"),
-        ("w_rel_strength", "Relative Strength"),
+        ("w_rel_strength", "Relative Strength"), ("w_hi52", "Near 52-Week High"),
     ]:
         cfg[key] = st.number_input(label, 0, 50, CONFIG[key], 5, key=f"wt_{key}",
                                    help=WEIGHT_HELP.get(key, ""))
     total_w = sum(cfg[k] for k in cfg if k.startswith("w_"))
-    st.caption(f"Total weight: **{total_w}**")
+    st.caption(f"Total weight: **{total_w}** — the score is auto-normalized to /100, "
+               f"so any total works.")
 
 with st.sidebar.expander("Backtest settings"):
     cfg["bt_threshold"] = st.slider("Score needed to take a trade", 50, 100,
@@ -875,6 +1368,48 @@ with st.sidebar.expander("Backtest settings"):
                                   CONFIG["bt_horizon"], 5)
     cfg["bt_lookback"] = st.slider("History to test (bars)", 250, 2000,
                                    CONFIG["bt_lookback"], 250)
+    cfg["bt_regime"] = st.checkbox(
+        "Regime filter — skip signals when benchmark < 200-day EMA",
+        CONFIG["bt_regime"],
+        help="Uses the benchmark's own history, date-aligned to each signal bar "
+             "(no look-ahead). Compare expectancy with/without to see how much "
+             "the market regime matters for this stock.")
+
+with st.sidebar.expander("💧 Retest settings (v3)"):
+    cfg["rt_scanback"] = st.slider(
+        "Breakout scan-back (bars)", 20, 80, CONFIG["rt_scanback"], 5,
+        help="How far back to look for a fresh cross above resistance. The broken "
+             "level is reconstructed from PRE-breakout data only, so it is frozen — "
+             "it cannot drift to the new post-breakout high.")
+    cfg["rt_band"] = st.slider(
+        "Retest zone (±% around level)", 0.5, 3.0, CONFIG["rt_band"], 0.25,
+        help="How close price must come back to the broken level to count as a retest.")
+    cfg["rt_fail_tol"] = st.slider(
+        "Fail tolerance (% close below level)", 0.5, 3.0, CONFIG["rt_fail_tol"], 0.25,
+        help="A CLOSE this far below the level kills the setup — the breakout failed.")
+    cfg["rt_window"] = st.slider(
+        "Retest window (bars after breakout)", 5, 40, CONFIG["rt_window"], 5,
+        help="If price never pulls back to the zone within this window it 'ran away' — "
+             "no retest trade.")
+    cfg["rt_trigger_loc"] = st.slider(
+        "Trigger close location (min)", 0.3, 0.9, CONFIG["rt_trigger_loc"], 0.05,
+        help="The bounce bar must touch the zone AND close this high in its own range "
+             "(0.6 = top 40%) to trigger the entry.")
+    rt_lo, rt_hi = st.slider("RSI reset band", 0, 100,
+                             (CONFIG["rt_rsi_low"], CONFIG["rt_rsi_high"]),
+                             help="Momentum should have cooled into this band during "
+                                  "the pullback — reset, not broken.")
+    cfg["rt_rsi_low"], cfg["rt_rsi_high"] = rt_lo, rt_hi
+    st.caption("**Retest scoring weights** (auto-normalized to /100):")
+    for key, label in [
+        ("rw_trend", "Trend Intact"), ("rw_break_quality", "Breakout Quality"),
+        ("rw_pullback_vol", "Pullback Volume Dry-up"),
+        ("rw_orderly", "Orderly Pullback"), ("rw_level_sig", "Level Significance"),
+        ("rw_rsi_reset", "RSI Reset"), ("rw_rel_strength", "Relative Strength"),
+        ("rw_hi52", "Near 52-Week High"),
+    ]:
+        cfg[key] = st.number_input(label, 0, 50, CONFIG[key], 5, key=f"rt_{key}",
+                                   help=RT_WEIGHT_HELP.get(key, ""))
 
 with st.sidebar.expander("Long-base settings"):
     cfg["lb_lookback"] = st.slider("Lookback (bars)", 250, 2500, CONFIG["lb_lookback"], 250,
@@ -905,9 +1440,10 @@ _wl = get_watchlist()
 with st.sidebar.expander(f"📋 Watchlist ({len(_wl)})"):
     st.write(", ".join(_wl) if _wl else "_Empty — add stocks from the analysis view._")
     st.caption("Session-only: kept for this browser session.")
-    new_t = st.text_input("Add ticker", key="wl_add", placeholder="e.g. TCS or TCS.NS")
+    new_t = st.text_input("Add ticker", key="wl_add",
+                          placeholder="e.g. TCS, TCS.NS or 500325.BO")
     if st.button("Add", key="wl_add_btn"):
-        t = normalize_ticker(new_t)
+        t = resolve_ticker(new_t, cfg["exchange"])
         if t and t not in _wl:
             set_watchlist(_wl + [t])
             st.rerun()
@@ -921,9 +1457,20 @@ with st.sidebar.expander(f"📋 Watchlist ({len(_wl)})"):
 # =====================================================================
 # MAIN UI
 # =====================================================================
-st.title("📈 Siva's Darvas Pivot Breakout")
+st.title("📈 Siva's Darvas Pivot Breakout — v3")
+st.caption("v3: everything in v2 + 💧 **Retest mode** — buy the pullback to a freshly "
+           "broken level, with a 🚀-break-vs-💧-retest backtest comparison.")
 
-mode = st.radio("Mode", ["Single ticker (detailed)", "Scan multiple"], horizontal=True)
+mc1, mc2 = st.columns([3, 2])
+with mc1:
+    mode = st.radio("Mode", ["Single ticker (detailed)", "Scan multiple"], horizontal=True)
+with mc2:
+    cfg["box_method"] = st.selectbox(
+        "Box / resistance method", ["Pivot High", "Darvas Box"],
+        help="Pivot High (default) = swing-high resistance with an ATR stop. "
+             "Darvas Box = the box ceiling is the breakout trigger and the box floor "
+             "is a structural stop. Run the backtest with each to compare. "
+             "(Kept on the main page so it's reachable on mobile.)")
 
 
 def render_checklist(checklist):
@@ -965,9 +1512,14 @@ def plain_summary(ticker, res, cfg):
     if res["confirmed"]:
         s += (f"✅ **Breakout confirmed today** on "
               f"{res['last_vol'] / res['avg_vol']:.1f}× average volume. ")
-    elif res["above"]:
+    elif res["above"] and not res["vol_ok"]:
         s += (f"Price is above resistance but volume hasn't confirmed — it needs "
               f"> **{vol_need:,.0f}** ({cfg['vol_surge_mult']}× avg). ")
+    elif res["above"]:                      # volume OK — the CLOSE was the blocker
+        s += (f"Volume is there ({res['last_vol'] / res['avg_vol']:.1f}× avg) but the "
+              f"**close was weak** — it finished at {res['close_loc'] * 100:.0f}% of the "
+              f"day's range (needs ≥ {cfg['close_loc_min'] * 100:.0f}%; strong closes "
+              f"confirm, mid/low-range closes are often rejections). ")
     else:
         s += (f"A valid breakout needs a close above **{res['entry']:.2f}** on volume "
               f"> **{vol_need:,.0f}** ({cfg['vol_surge_mult']}× the 20-day average). ")
@@ -1014,17 +1566,31 @@ def render_trade_plan(res, cfg):
                    "'2R' target — you aim to make twice what you're risking (a 2:1 "
                    "reward-to-risk trade).")
 
-    t1, t2, t3 = st.columns(3)
-    t1.metric("Entry", fmt(entry), help=entry_help)
-    t2.metric("Stop Loss", fmt(res["stop"]),
+    t1s = res.get("t1_struct")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Entry", fmt(entry), help=entry_help)
+    c2.metric("Stop Loss", fmt(res["stop"]),
               delta=f"{stop_pts:+.2f} pts ({stop_pct:+.2f}%)", delta_color="inverse",
               help=stop_help)
-    t3.metric("Target (2R)", fmt(res["target"]),
+    if t1s:
+        t1_pct = (t1s - entry) / entry * 100
+        c3.metric("Target 1", fmt(t1s),
+                  delta=f"{t1s - entry:+.2f} pts ({t1_pct:+.2f}%)",
+                  help="Nearest overhead resistance — the closest prior swing high "
+                       "above the entry, i.e. the first place sellers showed up "
+                       "before. A natural spot to book partial profits.")
+    else:
+        c3.metric("Target 1", "Blue sky ☀️",
+                  help="No prior swing high above the entry — all-time-high "
+                       "territory with no overhead resistance. Use Target 2 (2R) "
+                       "and/or a trailing stop.")
+    c4.metric("Target 2 (2R)", fmt(res["target"]),
               delta=f"{tgt_pts:+.2f} pts ({tgt_pct:+.2f}%)", help=target_help)
+    rr1_txt = (f"T1 Reward:Risk ≈ **{(t1s - entry) / res['risk']:.1f} : 1**  |  "
+               if t1s and res["risk"] else "")
     st.caption(f"Risk per share: **{res['risk']:.2f}** ({abs(stop_pct):.2f}% down)  |  "
-               f"Reward: **{tgt_pts:.2f}** ({tgt_pct:.2f}% up)  |  "
-               f"Reward:Risk ≈ **{res['rr']:.1f} : 1**  |  "
-               f"Entry triggers on a close above **{entry:.2f}**.")
+               f"{rr1_txt}T2 Reward:Risk ≈ **{res['rr']:.1f} : 1** (the backtested "
+               f"target)  |  Entry triggers on a close above **{entry:.2f}**.")
 
     # recalc from current price (only if price already past entry)
     if res["price"] > entry:
@@ -1042,12 +1608,23 @@ def render_trade_plan(res, cfg):
                    f"now means chasing. Below is the plan recalculated using the "
                    f"**current price as entry**.")
         st.write("#### 🔁 Plan If You Enter at Current Price")
-        r1, r2, r3 = st.columns(3)
+        t1c = overhead_target(res["df"], cur)  # nearest resistance above CURRENT price
+        r1, r2, r3, r4 = st.columns(4)
         r1.metric("Entry (current)", fmt(cur))
         r2.metric("Stop Loss", fmt(adj_stop),
                   delta=f"{adj_stop - cur:+.2f} pts ({a_stop_pct:+.2f}%)", delta_color="inverse",
                   help="Recalculated: current price − 1.5 × ATR(14).")
-        r3.metric("Target (2R)", fmt(adj_target),
+        if t1c:
+            r3.metric("Target 1", fmt(t1c),
+                      delta=f"{t1c - cur:+.2f} pts ({(t1c - cur) / cur * 100:+.2f}%)",
+                      help="Nearest overhead resistance above the CURRENT price — the "
+                           "first place sellers showed up before. A natural spot to "
+                           "book partial profits.")
+        else:
+            r3.metric("Target 1", "Blue sky ☀️",
+                      help="No prior swing high above the current price — "
+                           "all-time-high territory with no overhead resistance.")
+        r4.metric("Target 2 (2R)", fmt(adj_target),
                   delta=f"{adj_target - cur:+.2f} pts ({a_tgt_pct:+.2f}%)",
                   help="Recalculated: current price + 2 × (new risk).")
         st.caption(f"New risk per share: **{adj_risk:.2f}** ({abs(a_stop_pct):.2f}% down)  |  "
@@ -1075,6 +1652,18 @@ def render_trade_plan(res, cfg):
         st.warning(f"⚠️ Volume NOT confirmed yet: need ≥ {vol_threshold:,.0f} "
                    f"({cfg['vol_surge_mult']}× avg). A price break on weak volume often fails — "
                    f"wait for a high-volume close above {entry:.2f}.")
+
+    # close-location: a real breakout should CLOSE near the day's high
+    if res.get("close_loc") is not None:
+        loc = res["close_loc"] * 100
+        need = cfg.get("close_loc_min", 0.0) * 100
+        if res.get("loc_ok", True):
+            st.caption(f"📍 Close location: closed at **{loc:.0f}%** of the day's range "
+                       f"(≥ {need:.0f}% required) — a strong close.")
+        else:
+            st.warning(f"⚠️ **Weak close** — price closed at only {loc:.0f}% of the day's "
+                       f"range (need ≥ {need:.0f}%). A high-volume break that closes "
+                       f"mid/low-range is often a rejection, not a breakout.")
 
     if res["score"] < 65:
         st.warning("Score below 65 — setup not yet high quality. Levels shown for planning only.")
@@ -1217,7 +1806,17 @@ def render_long_base(res, cfg):
     # ----- level-based trade plan (structural: level + own history) -----
     plan = level_trade_plan(res["df"], lb, cfg)
     st.write("#### 🎯 Level-Based Trade Plan")
-    q1, q2, q3, q4 = st.columns(4)
+    # Target 2: the next overhead zone if one exists, else a 2R projection
+    if plan["t2"]:
+        t2_lvl, t2_help = plan["t2"], ("Next overhead resistance zone above Target 1 "
+                                       "— the second place sellers showed up before.")
+    elif plan["risk"] > 0:
+        t2_lvl = plan["entry"] + 2 * plan["risk"]
+        t2_help = ("No second overhead zone in the lookback — falls back to a 2R "
+                   "projection (entry + 2 × risk), matching the other trade plans.")
+    else:
+        t2_lvl, t2_help = None, "Unavailable (risk is not positive)."
+    q1, q2, q3, q4, q5 = st.columns(5)
     q1.metric("Entry (trigger)", fmt(plan["entry"]),
               help="Tested level × 1.002 — a decisive close just above the ceiling.")
     q2.metric("Stop", fmt(plan["stop"]),
@@ -1229,11 +1828,12 @@ def render_long_base(res, cfg):
               help="Nearest overhead resistance (prior swing high) — the first place sellers "
                    "showed up. A measured-move projection is used if there's no overhead "
                    "resistance (all-time highs).")
-    q4.metric("Reward : Risk", f"{plan['rr']:.1f} : 1")
+    q4.metric("Target 2", fmt(t2_lvl),
+              delta=(f"{(t2_lvl/plan['entry'] - 1) * 100:+.1f}%" if t2_lvl else None),
+              help=t2_help)
+    q5.metric("Reward : Risk (T1)", f"{plan['rr']:.1f} : 1")
 
     bits = [f"Risk/share **{plan['risk']:.2f}**", f"Stop rule: **{plan['stop_rule']}**"]
-    if plan["t2"]:
-        bits.append(f"T2 **{fmt(plan['t2'])}** ({(plan['t2']/plan['entry'] - 1) * 100:+.1f}%)")
     if plan["fallback"]:
         bits.append("_T1 is a measured-move projection (blue-sky — no overhead resistance)_")
     st.caption(" · ".join(bits))
@@ -1273,24 +1873,472 @@ def render_long_base(res, cfg):
     fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=bar_colors,
                          name="Volume", showlegend=False), row=2, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["Volume"].rolling(20).mean(),
-                             name="20-day avg vol", line=dict(color="black", width=1.2)),
+                             name="20-day avg vol", line=dict(color="#888", width=1.2)),
                   row=2, col=1)
-    fig.update_layout(height=560, title="Long-tested ceiling, touches & volume",
+    fig.update_layout(height=520, title="Long-tested ceiling, touches & volume",
                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+# ----- retest view (v3) -----
+RT_STATE_INFO = {
+    "extended": ("⏳", "info",
+                 "Broke out and is EXTENDED above the level — no pullback yet. Chasing "
+                 "here is the low-odds entry; wait for price to come back to the zone."),
+    "pulling_back": ("💧", "info",
+                     "Pulling back toward the broken level — getting close. Do nothing "
+                     "yet; let it reach the buy zone."),
+    "at_retest": ("🎯", "success",
+                  "IN THE RETEST ZONE — old resistance is being tested as new support. "
+                  "Watch for a strong-close bounce bar to trigger the entry."),
+    "triggered": ("✅", "success",
+                  "RETEST TRIGGERED — a bounce bar touched the zone and closed strong. "
+                  "This is the retest entry; stop goes just below the retest low."),
+    "failed": ("❌", "error",
+               "FAILED — price closed decisively back below the level. The breakout is "
+               "dead; stand aside. (This is exactly the trade the retest policy avoids.)"),
+    "ran_away": ("🏃", "warning",
+                 "RAN AWAY — never pulled back to the zone within the window. The move "
+                 "left without you; wait for the next base instead of chasing."),
+}
+
+
+def render_retest(ticker, res, cfg):
+    st.write("### 💧 Retest — buy the pullback to the broken level")
+    st.caption("After a breakout, price often returns to the broken ceiling (old "
+               "resistance → new support). Entering on that retest gives a tight, "
+               "STRUCTURAL stop just below the level — typically far less risk per "
+               "share than the ATR stop of a breakout entry. The level shown is "
+               "**frozen as of the breakout day**: it is reconstructed from "
+               "pre-breakout data only, so it cannot drift to the new high no matter "
+               "when you run this.")
+    rt = res.get("retest")
+    if not rt:
+        st.info(f"No fresh cross above resistance found in the last "
+                f"{cfg.get('rt_scanback', 40)} bars — nothing to retest. This view "
+                f"activates once the stock breaks a level.")
+        return
+    bo, rst, plan = rt["bo"], rt["st"], rt["plan"]
+
+    if rst["state"] == "failed" and rst["dist_pct"] > 1.0:
+        # stale failure: price has RECLAIMED the level — caution flag, not a veto
+        st.warning(f"❌→🔄 **FAILED, THEN RECLAIMED** — the break of {bo['level']:.2f} "
+                   f"did fail (a close below the fail level), but price has since "
+                   f"recovered to **{rst['dist_pct']:+.1f}% above** it. The failure is "
+                   f"history, not the current situation — treat it as a caution flag "
+                   f"(this stock faked out here before), not a stand-aside. A confirmed "
+                   f"close above the CURRENT resistance starts a fresh breakout/retest "
+                   f"cycle, which this tab will then track.")
+    else:
+        emoji, kind, msg = RT_STATE_INFO.get(rst["state"], ("", "info", rst["state"]))
+        {"info": st.info, "success": st.success,
+         "warning": st.warning, "error": st.error}[kind](f"{emoji} {msg}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Broken level (frozen)", fmt(bo["level"]),
+              help=f"Resistance as it stood on the eve of the breakout of "
+                   f"{bo['date']:%d %b %Y} ({bo['bars_ago']} bars ago). Reconstructed "
+                   f"from pre-breakout history — not stored, cannot drift.")
+    c2.metric("Break quality", f"{bo['vol_ratio']:.1f}× vol",
+              help=f"Breakout-day volume vs its prior 20-day average; close location "
+                   f"{bo['close_loc']:.2f}. "
+                   f"{'Confirmed break.' if bo['confirmed'] else 'NOT confirmed.'}")
+    c3.metric("Post-break high", fmt(rst["ext_high"]))
+    c4.metric("Distance to level", f"{rst['dist_pct']:+.2f}%",
+              help="+ = price above the level, − = below it.")
+    if not bo["confirmed"]:
+        st.warning("⚠️ The original break was NOT volume/close-confirmed — a 'retest' "
+                   "of a weak break is usually just the failure in progress. This is "
+                   "why Breakout Quality carries the top weight in the score below.")
+
+    g1, g2 = st.columns([1, 2])
+    with g1:
+        st.plotly_chart(score_gauge(rt["score"]), use_container_width=True,
+                        config={"displayModeBar": False}, key="rt_gauge")
+    with g2:
+        st.write("#### 🎯 Retest Trade Plan")
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Entry", fmt(plan["entry"]),
+                  help="Today's close if the bounce triggered; otherwise level × 1.002 "
+                       "— the plan if/when a bounce bar fires in the zone.")
+        q2.metric("Stop", fmt(plan["stop"]),
+                  delta=f"{(plan['stop'] / plan['entry'] - 1) * 100:+.1f}%",
+                  delta_color="inverse",
+                  help="Just below the retest low (or the bottom of the buy zone if it "
+                       "hasn't been touched yet) — a structural stop under real support.")
+        if plan["t1"]:
+            q3.metric("Target 1", fmt(plan["t1"]),
+                      delta=f"{(plan['t1'] / plan['entry'] - 1) * 100:+.1f}%",
+                      help="The post-breakout high — price has already traded there "
+                           "once, so it's the first natural profit-booking spot.")
+        else:
+            q3.metric("Target 1", "—",
+                      help="The post-breakout high isn't meaningfully above the entry "
+                           "(the move hasn't extended yet) — use Target 2 (2R).")
+        if plan["t2"]:
+            q4.metric("Target 2 (2R)", fmt(plan["t2"]),
+                      delta=f"{(plan['t2'] / plan['entry'] - 1) * 100:+.1f}%",
+                      help="Entry + 2 × risk — twice what you're risking, matching the "
+                           "breakout plan's backtested target.")
+        else:
+            q4.metric("Target 2 (2R)", "—")
+        bits = [f"Buy zone **{rst['zone_lo']:.2f} – {rst['zone_hi']:.2f}**",
+                f"Fail level **{rst['fail_lvl']:.2f}** (a CLOSE below = setup dead)",
+                f"Risk/share **{plan['risk']:.2f}**"]
+        if plan["rr1"]:
+            bits.append(f"R:R to Target 1 **{plan['rr1']:.1f} : 1**")
+        st.caption(" · ".join(bits))
+        if rst["pull_vol_ratio"] is not None:
+            st.caption(f"Pullback character: {rst['pullback_bars']} bar(s), "
+                       f"{rst['retrace'] * 100:.0f}% retrace of the post-break move, "
+                       f"volume {rst['pull_vol_ratio']:.2f}× the pre-break average.")
+
+    render_checklist(rt["checklist"])
+
+    # ----- chart: close + frozen level + buy zone + breakout marker -----
+    dfc = res["df"].tail(int(cfg.get("rt_scanback", 40)) + 80)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                        row_heights=[0.72, 0.28])
+    fig.add_trace(go.Scatter(x=dfc.index, y=dfc["Close"], name="Close",
+                             line=dict(color="#1f77b4", width=1.2)), row=1, col=1)
+    fig.add_hrect(y0=rst["zone_lo"], y1=rst["zone_hi"],
+                  fillcolor="rgba(46,204,113,0.12)", line_width=0, row=1, col=1)
+    fig.add_hline(y=bo["level"], line_dash="dash", line_color="#2ca02c",
+                  annotation_text=f"Broken level {bo['level']:.2f}", row=1, col=1)
+    fig.add_hline(y=rst["fail_lvl"], line_dash="dot", line_color="#e74c3c",
+                  annotation_text="Fail level", row=1, col=1)
+    fig.add_hline(y=plan["stop"], line_dash="dot", line_color="#e74c3c",
+                  annotation_text="Stop", row=1, col=1)
+    if plan["t1"]:
+        fig.add_hline(y=plan["t1"], line_dash="dot", line_color="#9467bd",
+                      annotation_text="T1 (post-break high)", row=1, col=1)
+    bx = bo["date"].isoformat()
+    fig.add_vline(x=bx, line_dash="dot", line_color="green", row=1, col=1)
+    fig.add_annotation(x=bx, y=bo["level"], text="Breakout", showarrow=False,
+                       yshift=10, font=dict(color="green", size=11), row=1, col=1)
+    up = dfc["Close"] >= dfc["Open"]
+    fig.add_trace(go.Bar(x=dfc.index, y=dfc["Volume"],
+                         marker_color=["#26a69a" if u else "#ef5350" for u in up],
+                         name="Volume", showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=dfc.index, y=dfc["Volume"].rolling(20).mean(),
+                             name="20-day avg vol",
+                             line=dict(color="#888", width=1.2)), row=2, col=1)
+    fig.update_layout(height=520, title=f"{ticker} — retest of the frozen level",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+# =====================================================================
+# VERDICT (v3) — transparent rules engine + historical evidence
+# =====================================================================
+def build_verdict(res, cfg, regime, earnings_days):
+    """Deterministic rules -> one actionable verdict with every input visible.
+    Combines only evidence the other tabs already show, in the priority order
+    of the pre-trade checklist. Pure function — no UI, easily testable."""
+    factors = []
+
+    def add(status, label, detail):
+        factors.append({"status": status, "label": label, "detail": detail})
+
+    rt = res.get("retest")
+    rt_state = rt["st"]["state"] if rt else None
+    rt_dist = rt["st"].get("dist_pct", 0.0) if rt else 0.0
+    # a failure is STALE once price has reclaimed the failed level — it is
+    # historical context (a prior fake-out), not the current situation
+    rt_stale_fail = rt_state == "failed" and rt_dist > 1.0
+
+    score = res["score"]
+    if score >= 80:
+        add("pass", "Setup score", f"{score}/100 — strong structure")
+    elif score >= 65:
+        add("warn", "Setup score", f"{score}/100 — decent, not yet strong")
+    else:
+        add("fail", "Setup score", f"{score}/100 — weak structure")
+
+    if res["confirmed"]:
+        add("pass", "Breakout trigger", "confirmed today (price + volume + strong close)")
+    elif res["above"] and not res["vol_ok"]:
+        add("warn", "Breakout trigger", "above resistance but volume not confirmed")
+    elif res["above"]:
+        add("warn", "Breakout trigger",
+            f"above resistance on volume, but a weak close "
+            f"({res.get('close_loc', 1.0) * 100:.0f}% of the day's range)")
+    elif rt_state in ("triggered", "at_retest", "pulling_back"):
+        add("warn", "Breakout trigger",
+            "below the CURRENT resistance (the post-break high) — normal during a "
+            "retest; the FROZEN broken level governs this verdict")
+    else:
+        add("warn", "Breakout trigger", "not triggered — price still below resistance")
+
+    if regime is None:
+        add("warn", "Market regime", "benchmark data unavailable")
+    elif regime["risk_on"]:
+        add("pass", "Market regime", f"RISK-ON ({regime['pct']:+.1f}% vs 200-EMA)")
+    else:
+        add("fail", "Market regime",
+            f"RISK-OFF ({regime['pct']:+.1f}% vs 200-EMA) — most breakouts fail here")
+
+    if res.get("liquid", True):
+        add("pass", "Liquidity", f"₹{res['turnover_cr']:.1f} Cr avg daily turnover")
+    else:
+        add("fail", "Liquidity", f"only ₹{res['turnover_cr']:.1f} Cr — below your floor")
+
+    trend_ok = res["checklist"].get("Trend", {}).get("passed", False)
+    add("pass" if trend_ok else "fail", "Trend",
+        "EMA stack aligned (price > 20 > 50 > 200)" if trend_ok else "EMA stack broken")
+
+    chase_pct = (res["price"] - res["entry"]) / res["entry"] * 100
+    if chase_pct <= 0:
+        add("pass", "Extension", "at/below the entry trigger — no chasing needed")
+    elif chase_pct <= cfg["near_pct"]:
+        add("warn", "Extension", f"{chase_pct:.1f}% above entry — mild chase")
+    else:
+        add("fail", "Extension", f"{chase_pct:.1f}% above entry — extended, don't chase")
+
+    if rt and rt_stale_fail:
+        add("warn", "Retest",
+            f"an earlier break of {rt['bo']['level']:.2f} failed, but price has since "
+            f"reclaimed it (+{rt_dist:.1f}% above) — historical fake-out, worth "
+            f"caution; a close above the current resistance starts a fresh cycle")
+    elif rt:
+        add({"triggered": "pass", "at_retest": "pass", "pulling_back": "warn",
+             "extended": "warn", "failed": "fail", "ran_away": "warn"}[rt_state],
+            "Retest", f"{rt_state.replace('_', ' ')} (retest score {rt['score']}/100)")
+
+    if earnings_days is None:
+        add("warn", "Earnings", "next earnings date unknown — check manually")
+    elif earnings_days <= 5:
+        add("fail", "Earnings",
+            f"in {earnings_days} day(s) — breakouts into earnings are coin-flips")
+    elif earnings_days <= 10:
+        add("warn", "Earnings", f"in {earnings_days} day(s)")
+    else:
+        add("pass", "Earnings", f"{earnings_days} days away")
+
+    # ---- decision (priority order) ----
+    risk_on = bool(regime and regime["risk_on"])
+    if not res.get("liquid", True):
+        code, kind, head = "AVOID", "error", "⛔ STAND ASIDE — illiquid"
+        action = ("Turnover is below your floor; spreads and slippage eat the edge "
+                  "regardless of the chart.")
+    elif earnings_days is not None and earnings_days <= 5:
+        code, kind = "AVOID", "error"
+        head = f"⛔ STAND ASIDE — earnings in {earnings_days} day(s)"
+        action = "Structure is irrelevant through an earnings gap. Revisit after the report."
+    elif rt_state == "failed" and not rt_stale_fail:
+        code, kind, head = "AVOID", "error", "🔴 STAND ASIDE — the breakout failed"
+        action = "Price closed back below the broken level. Wait for a new base to form."
+    elif rt_state in ("triggered", "at_retest") and rt["score"] >= 65:
+        if rt_state == "triggered":
+            code, kind, head = "BUY_RETEST", "success", "💧 BUY THE RETEST — bounce triggered"
+            action = ("Enter per the Retest plan; stop below the retest low, exit on a "
+                      "close below the fail level."
+                      + ("" if risk_on else " Regime is RISK-OFF — size down."))
+        else:
+            code, kind, head = "WATCH_RETEST", "info", "🎯 AT THE RETEST ZONE — watch for the bounce"
+            action = ("Price is testing the broken level from above. A strong-close "
+                      "bounce bar in the zone is the entry trigger.")
+    elif res["confirmed"] and score >= 80 and chase_pct <= cfg["near_pct"] and risk_on:
+        code, kind, head = "BUY_BREAKOUT", "success", "🟢 BUY THE BREAKOUT — everything lines up"
+        action = ("Confirmed break, strong setup, healthy regime. Enter per the Trade "
+                  "Plan; the stop is non-negotiable.")
+    elif res["confirmed"] and score >= 80:
+        code, kind, head = "BUY_CAUTION", "warning", "🟡 CONFIRMED, BUT…"
+        blockers = []
+        if not risk_on:
+            blockers.append("the market regime is RISK-OFF")
+        if chase_pct > cfg["near_pct"]:
+            blockers.append(f"price is {chase_pct:.1f}% extended past entry")
+        action = ("Setup and trigger are valid, but " + " and ".join(blockers) +
+                  ". Trade smaller, or wait for the retest.")
+    elif res["above"] and score >= 65:
+        need = ("a volume surge" if not res["vol_ok"]
+                else "a strong close (top of the day's range)")
+        code, kind, head = "WAIT_CONFIRM", "warning", "🟡 WAIT — breakout not confirmed"
+        action = (f"Price is over the line but needs {need} to confirm. Unconfirmed "
+                  f"breaks fail often — no entry yet.")
+    elif chase_pct > cfg["near_pct"] and score >= 65:
+        code, kind, head = "WAIT_RETEST", "warning", "⏳ WAIT — extended past entry"
+        action = ("Don't chase. Keep it on the watchlist and let the Retest tab flag "
+                  "the pullback entry.")
+    elif score >= 80:
+        code, kind, head = "SET_ALERT", "info", "🟢 COILED — set an alert at the entry"
+        action = (f"Strong structure, not yet triggered. Alert at {res['entry']:.2f}; "
+                  f"act only on a confirmed break.")
+    elif score >= 65:
+        code, kind, head = "WATCH", "info", "🟡 WATCH — developing setup"
+        action = "Some ingredients are in place. Re-check in a few sessions; no entry yet."
+    else:
+        code, kind, head = "NO_TRADE", "error", "🔴 NO TRADE — weak setup"
+        action = "Structure quality is low. There are better charts; move on."
+
+    return {"code": code, "kind": kind, "headline": head, "action": action,
+            "factors": factors, "chase_pct": chase_pct}
+
+
+def _bt_cache_key(ticker, cfg, tag):
+    """Session-cache key: any setting that changes backtest results is included."""
+    keys = ("box_method", "benchmark", "bt_threshold", "bt_horizon", "bt_lookback",
+            "bt_regime", "vol_surge_mult", "close_loc_min", "near_pct",
+            "rsi_low", "rsi_high", "near_hi52_pct")
+    wkeys = tuple(sorted(k for k in cfg if k.startswith(("w_", "rw_", "rt_"))))
+    return (ticker, tag,
+            tuple(cfg.get(k) for k in keys),
+            tuple((k, cfg[k]) for k in wkeys))
+
+
+def render_verdict(ticker, res, cfg):
+    st.write("### 🧭 Verdict — all the evidence, one call")
+    st.caption("A transparent rules engine: it combines the same evidence the other "
+               "tabs show (score, trigger, regime, liquidity, trend, extension, "
+               "retest, earnings) in pre-trade-checklist priority order. Every input "
+               "is listed below the call — audit it, don't obey it. Decision support, "
+               "**not investment advice**.")
+
+    regime = market_regime(cfg["benchmark"])
+    edate = next_earnings_date(ticker)
+    edays = None
+    if edate is not None:
+        edays = int((pd.Timestamp(edate).normalize()
+                     - pd.Timestamp.today().normalize()).days)
+        if edays < 0:
+            edays = None                      # stale past date → treat as unknown
+    v = build_verdict(res, cfg, regime, edays)
+
+    {"success": st.success, "info": st.info,
+     "warning": st.warning, "error": st.error}[v["kind"]](
+        f"**{v['headline']}**\n\n{v['action']}")
+
+    icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}
+    for f in v["factors"]:
+        st.write(f"{icon[f['status']]} **{f['label']}** — {f['detail']}")
+    if edate is not None:
+        st.caption(f"Next earnings: **{pd.Timestamp(edate):%d %b %Y}** "
+                   f"(best-effort from Yahoo — verify).")
+
+    # ---- position sizing (risk-based) ----
+    st.write("#### ⚖️ Position size")
+    s1, s2 = st.columns(2)
+    capital = s1.number_input("Capital (₹)", 10000.0, 1e10, 500000.0, 50000.0,
+                              key="vd_cap")
+    risk_pct = s2.number_input("Risk per trade (%)", 0.25, 5.0, 1.0, 0.25,
+                               key="vd_risk",
+                               help="Max % of capital lost if the stop is hit. "
+                                    "1% is the classic default.")
+    rt = res.get("retest")
+    if v["code"] in ("BUY_RETEST", "WATCH_RETEST") and rt:
+        entry, stop, plan_name = rt["plan"]["entry"], rt["plan"]["stop"], "Retest plan"
+    elif v["chase_pct"] > 0:
+        entry = res["price"]
+        stop = res["price"] - 1.5 * res["atr"]
+        plan_name = "current-price plan"
+    else:
+        entry, stop, plan_name = res["entry"], res["stop"], "breakout plan"
+    rps = entry - stop
+    if rps > 0:
+        risk_amt = capital * risk_pct / 100
+        qty = int(risk_amt // rps)
+        st.caption(f"Using the **{plan_name}** (entry {entry:.2f}, stop {stop:.2f}, "
+                   f"risk/share {rps:.2f}): risking **₹{risk_amt:,.0f}** → "
+                   f"**{qty:,} shares** ≈ ₹{qty * entry:,.0f} "
+                   f"({(qty * entry / capital * 100) if capital else 0:.0f}% of capital).")
+        if qty == 0:
+            st.warning("Risk per share exceeds the risk budget — skip, or raise "
+                       "capital/risk %.")
+        elif qty * entry > capital:
+            st.warning("Position value exceeds capital — cap the quantity; your "
+                       "effective risk will be lower than budgeted.")
+    else:
+        st.caption("Stop is not below entry — sizing unavailable.")
+
+    # ---- historical evidence: auto-backtest, cached per settings ----
+    show_ev = st.toggle("📊 Historical evidence (auto-backtest — first load takes a "
+                        "few seconds, then cached)", value=True, key="vd_ev")
+    if not show_ev:
+        return
+    cache = st.session_state.setdefault("verdict_bt_cache", {})
+    k1 = _bt_cache_key(ticker, cfg, "thr")
+    if k1 not in cache:
+        with st.spinner("Replaying history at your threshold…"):
+            cache[k1] = backtest(res["df"], cfg, policy="breakout")
+    bt = cache[k1]
+    k0 = _bt_cache_key(ticker, cfg, "all")
+    if k0 not in cache:
+        with st.spinner("Building the score-calibration table…"):
+            cache[k0] = backtest(res["df"], cfg, policy="breakout", threshold=0)
+    bt0 = cache[k0]
+
+    st.write("#### 📊 Historical evidence — this setup, this stock")
+    if bt.get("trades", 0):
+        st.write(f"Signals like this one (score ≥ {cfg['bt_threshold']} + confirmed "
+                 f"break) on **{ticker}**: **{bt['trades']} trades**, win rate "
+                 f"**{bt['win_rate']:.0f}%** ({bt['wins']}W/{bt['losses']}L/"
+                 f"{bt['timeouts']}T), **{bt['expectancy']:+.2f}R** per trade, "
+                 f"**{bt['r_per_signal']:+.2f}R** per signal.")
+        if bt["expectancy"] > 0:
+            st.success("✅ This setup has been historically profitable on this stock.")
+        else:
+            st.warning("⚠️ Historically flat/negative on this stock — the structure "
+                       "may look right, but the base rate argues for extra caution.")
+        if bt["trades"] < 8:
+            st.caption("⚠️ Small sample — treat the base rate as weak evidence.")
+    else:
+        st.caption(f"No historical signals at score ≥ {cfg['bt_threshold']} in the "
+                   f"lookback — no per-stock base rate at this threshold.")
+
+    detail = bt0.get("trades_detail", [])
+    if detail:
+        st.write("**Score calibration** — did higher scores actually win more on "
+                 "this stock?")
+        rows = []
+        for lo, hi in ((0, 50), (50, 65), (65, 80), (80, 101)):
+            sel = [t for t in detail if lo <= t.get("score", 0) < hi]
+            resolved = [t for t in sel if t["outcome"] in ("win", "loss")]
+            wins = sum(1 for t in resolved if t["outcome"] == "win")
+            rows.append({
+                "Score band": f"{lo}–{100 if hi == 101 else hi - 1}",
+                "Events": len(sel),
+                "Win rate %": round(wins / len(resolved) * 100) if resolved else None,
+                "Avg R": round(sum(t["r"] for t in sel) / len(sel), 2) if sel else None,
+            })
+        st.dataframe(pd.DataFrame(rows).style.format(na_rep="—", precision=2),
+                     hide_index=True, use_container_width=True)
+        st.caption("Every confirmed breakout in the lookback (no score threshold), "
+                   "bucketed by its as-of score. Win rate rising down the table = "
+                   "the score is informative on this stock; flat = it isn't. Small "
+                   "buckets are noise — judge accordingly.")
+    else:
+        st.caption("No confirmed-breakout events in the lookback to calibrate against.")
 
 
 def render_single(ticker, res, cfg):
     info = load_info(ticker)
     stats = build_stats(res["df"], info)
 
+    # ----- company name header -----
+    long_name = info.get("longName") or info.get("shortName")
+    if long_name and long_name.upper() != ticker:
+        st.subheader(f"🏢 {long_name}  ·  {ticker}")
+        sec_ind = " · ".join(x for x in (info.get("sector"), info.get("industry")) if x)
+        if sec_ind:
+            st.caption(sec_ind)
+    else:
+        st.subheader(f"🏢 {ticker}")
+
     # ----- method indicator -----
     method = res.get("box_method", "Pivot High")
     chip = "🟦 Darvas Box" if method == "Darvas Box" else "🟩 Pivot High"
     st.markdown(f"🧭 **Method:** {chip} — resistance & stop are derived from the "
-                f"**{method}** logic (change it in the sidebar).")
+                f"**{method}** logic (switch it at the top of the page).")
+    if not res.get("liquid", True):
+        st.warning(f"⚠️ **Low liquidity** — 20-day average turnover is only "
+                   f"**₹{res['turnover_cr']:.1f} Cr** (your floor: "
+                   f"₹{cfg['min_turnover_cr']:g} Cr). Wide spreads and slippage make "
+                   f"breakout trades unreliable here regardless of the chart.")
 
     # ----- market regime + plain-language summary -----
     render_regime(cfg)
@@ -1304,7 +2352,8 @@ def render_single(ticker, res, cfg):
         "pivot is found, we fall back to the highest High of the last 120 bars.")
     gcol, mcol = st.columns([1, 2])
     with gcol:
-        st.plotly_chart(score_gauge(res["score"]), use_container_width=True)
+        st.plotly_chart(score_gauge(res["score"]), use_container_width=True,
+                        config={"displayModeBar": False})
     with mcol:
         m1, m2, m3 = st.columns(3)
         m1.metric("Price", fmt(res["price"]))
@@ -1327,18 +2376,40 @@ def render_single(ticker, res, cfg):
     if res["confirmed"]:
         st.success(f"🚀 BREAKOUT CONFIRMED TODAY — close above resistance on "
                    f"{res['last_vol']/res['avg_vol']:.1f}× average volume.")
-    elif res["above"]:
+    elif res["above"] and not res["vol_ok"]:
         st.info("Price is above resistance but volume hasn't confirmed yet.")
+    elif res["above"]:                      # volume OK — the CLOSE was the blocker
+        st.info(f"Price is above resistance on "
+                f"{res['last_vol']/res['avg_vol']:.1f}× volume, but the **close was "
+                f"weak** — it finished at {res.get('close_loc', 1.0)*100:.0f}% of the "
+                f"day's range (need ≥ {cfg.get('close_loc_min', 0.0)*100:.0f}%). A "
+                f"high-volume break that closes mid/low-range is often a rejection.")
 
     # ----- multi-year base breakout badge (prominent) -----
     _badge = longbase_badge(res.get("long_base"))
     if _badge:
         (st.success if _badge[0] == "success" else st.info)(_badge[1])
 
+    # ----- retest banner (v3): only the actionable states -----
+    _rt = res.get("retest")
+    if _rt and _rt["st"]["state"] in ("at_retest", "triggered"):
+        _lvl = _rt["bo"]["level"]
+        if _rt["st"]["state"] == "triggered":
+            st.success(f"💧 **RETEST TRIGGERED TODAY** — bounced off the broken level "
+                       f"{_lvl:.2f} with a strong close (retest score "
+                       f"{_rt['score']}/100). See the 💧 Retest tab for the plan.")
+        else:
+            st.info(f"💧 **AT THE RETEST ZONE** — testing the broken level {_lvl:.2f} "
+                    f"from above (retest score {_rt['score']}/100). Watch for a "
+                    f"strong-close bounce bar — details in the 💧 Retest tab.")
+
     # ----- tabs -----
-    tab_o, tab_c, tab_t, tab_ch, tab_lb, tab_b = st.tabs(
-        ["📋 Overview", "📊 Checklist", "💰 Trade Plan", "📈 Chart",
-         "🏛 Long Base", "🔁 Backtest"])
+    tab_v, tab_o, tab_c, tab_t, tab_ch, tab_lb, tab_rt, tab_b = st.tabs(
+        ["🧭 Verdict", "📋 Overview", "📊 Checklist", "💰 Trade Plan", "📈 Chart",
+         "🏛 Long Base", "💧 Retest", "🔁 Backtest"])
+
+    with tab_v:
+        render_verdict(ticker, res, cfg)
 
     with tab_o:
         st.write("#### 🧾 Current Stats")
@@ -1392,47 +2463,109 @@ def render_single(ticker, res, cfg):
     with tab_lb:
         render_long_base(res, cfg)
 
+    with tab_rt:
+        render_retest(ticker, res, cfg)
+
     with tab_b:
         render_backtest(ticker, res, cfg)
+
+
+def _policy_row(name, b):
+    """One row of the entry-policy comparison table."""
+    has = b.get("trades", 0) > 0
+    return {
+        "Policy": name,
+        "Signals": b.get("signals", 0),
+        "Trades": b.get("trades", 0),
+        "Missed": b.get("missed", 0),
+        "Avoided": b.get("avoided", 0),
+        "Win rate %": round(b["win_rate"]) if has else None,
+        "R/trade": round(b["expectancy"], 2) if has else None,
+        "R/signal": round(b.get("r_per_signal", 0.0), 2),
+        "Avg hold": round(b["avg_hold"]) if has else None,
+    }
 
 
 def render_backtest(ticker, res, cfg):
     st.write("### 🔁 Backtest — does this score actually work?")
     st.caption(f"Replays history using the **{cfg.get('box_method', 'Pivot High')}** method: "
-               f"every time the score reached **≥ {cfg['bt_threshold']}** with a "
-               f"volume-confirmed breakout, it simulates the same Entry/Stop/Target and "
-               f"checks whether Target (+2R) or Stop (−1R) hit first within "
-               f"{cfg['bt_horizon']} bars. Switch the method in the sidebar and re-run to compare.")
-    if st.button("Run backtest"):
+               f"every time the score reached **≥ {cfg['bt_threshold']}** with a confirmed "
+               f"breakout (volume + close-location), a trade is filled at the **next bar's "
+               f"open**, then Target (+2R) vs Stop raced over {cfg['bt_horizon']} bars. "
+               f"Gaps through the stop exit at the open (losses can exceed 1R); trades that "
+               f"time out are marked to market and excluded from the win rate.")
+    if cfg.get("bt_regime"):
+        st.caption("🛡️ Regime filter ON — signals that fired while the benchmark was "
+                   "below its 200-day EMA are skipped.")
+    compare = st.checkbox(
+        "🔬 Compare entry policies: 🚀 buy the break vs 💧 buy the retest",
+        value=False,
+        help="Runs the SAME signals through two entry policies. Breakout fills at the "
+             "next open. Retest waits for a pullback into the zone and a strong-close "
+             "bounce bar — it misses moves that never pull back, but dodges breakouts "
+             "that fail before triggering. Compare them on R/signal.")
+    if st.button("Run backtest", type="primary", use_container_width=True):
         st.session_state["run_bt"] = True
     if not st.session_state.get("run_bt"):
         return
 
     with st.spinner("Backtesting…"):
-        bt = backtest(res["df"], cfg)
+        bt = backtest(res["df"], cfg, policy="breakout")
+        bt_rt = backtest(res["df"], cfg, policy="retest") if compare else None
 
-    if bt.get("trades", 0) == 0:
+    if bt.get("signals", 0) == 0:
         st.info("No historical signals at this threshold — try lowering the backtest "
                 "score threshold in the sidebar, or widening the history window.")
         return
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Trades", bt["trades"])
-    m2.metric("Win rate", f"{bt['win_rate']:.0f}%", help=f"{bt['wins']}W / {bt['losses']}L")
-    m3.metric("Expectancy", f"{bt['expectancy']:+.2f}R",
-              help="Average R-multiple per trade. Positive = the setup made money "
-                   "historically (1R = the amount risked).")
-    m4.metric("Avg hold", f"{bt['avg_hold']:.0f} bars")
-
-    if bt["expectancy"] > 0:
-        st.success(f"✅ Positive edge in this sample: {bt['win_rate']:.0f}% win rate, "
-                   f"{bt['expectancy']:+.2f}R per trade over {bt['trades']} trades.")
+    if bt.get("trades", 0):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Trades", bt["trades"])
+        m2.metric("Win rate", f"{bt['win_rate']:.0f}%",
+                  help=f"{bt['wins']}W / {bt['losses']}L · {bt['timeouts']} timed out "
+                       f"(timeouts count in expectancy but not in the win rate)")
+        m3.metric("Expectancy", f"{bt['expectancy']:+.2f}R",
+                  help="Average R-multiple per trade. Positive = the setup made money "
+                       "historically (1R = the amount risked).")
+        m4.metric("Avg hold", f"{bt['avg_hold']:.0f} bars")
+        if bt["expectancy"] > 0:
+            st.success(f"✅ Positive edge in this sample: {bt['win_rate']:.0f}% win rate, "
+                       f"{bt['expectancy']:+.2f}R per trade over {bt['trades']} trades.")
+        else:
+            st.warning(f"⚠️ Negative/flat edge in this sample ({bt['expectancy']:+.2f}R). "
+                       f"The score didn't reliably predict breakouts for this stock.")
     else:
-        st.warning(f"⚠️ Negative/flat edge in this sample ({bt['expectancy']:+.2f}R). "
-                   f"The score didn't reliably predict breakouts for this stock.")
-    st.caption("⚠️ Indicative only: single stock, no costs/slippage, stop checked before "
-               "target on the same bar, and the Relative-Strength input carries minor "
-               "look-ahead. Use it to compare settings, not as a guarantee.")
+        st.info("Signals occurred but no breakout-policy trade could be filled "
+                "(gaps below the stop / missing ATR).")
+
+    if bt_rt is not None:
+        st.write("#### 🔬 Entry-policy comparison — same signals, two entries")
+        comp = pd.DataFrame([
+            _policy_row("🚀 Breakout (next open)", bt),
+            _policy_row("💧 Retest (wait for pullback)", bt_rt),
+        ])
+        st.dataframe(comp.style.format(na_rep="—", precision=2),
+                     hide_index=True, use_container_width=True)
+        a_rs = bt.get("r_per_signal", 0.0)
+        b_rs = bt_rt.get("r_per_signal", 0.0)
+        if b_rs > a_rs:
+            st.success(f"💧 For this stock & settings, **waiting for the retest** earned "
+                       f"more per signal ({b_rs:+.2f}R vs {a_rs:+.2f}R). It dodged "
+                       f"{bt_rt.get('avoided', 0)} failed break(s) at the cost of "
+                       f"{bt_rt.get('missed', 0)} runner(s) that never pulled back.")
+        else:
+            st.info(f"🚀 For this stock & settings, **buying the break** earned more per "
+                    f"signal ({a_rs:+.2f}R vs {b_rs:+.2f}R) — {bt_rt.get('missed', 0)} "
+                    f"of the moves ran away without ever giving a retest.")
+        st.caption("**R/signal** spreads each policy's total R across ALL signals — it "
+                   "charges the retest policy 0R for runners it missed and 0R (instead "
+                   "of a loss) for failed breaks it avoided. Compare policies on "
+                   "R/signal, not win rate: the retest win rate is flattered by "
+                   "skipping the worst trades.")
+    st.caption("⚠️ Indicative only: single stock, usually small samples, no brokerage/"
+               "slippage, and the stop is checked before the target on the same bar "
+               "(conservative). Use it to compare settings and methods, not as a "
+               "profit guarantee.")
 
 
 def render_chart(ticker, res):
@@ -1447,12 +2580,15 @@ def render_chart(ticker, res):
     for col, color in [("EMA20", "blue"), ("EMA50", "orange"), ("EMA200", "red")]:
         fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col,
                                  line=dict(color=color, width=1)), row=1, col=1)
-    for y, dash, color, label in [
+    plan_lines = [
         (res["resistance"], "dash", "green", "Resistance"),
         (res["entry"], "dot", "blue", "Entry"),
         (res["stop"], "dot", "red", "Stop Loss"),
-        (res["target"], "dot", "purple", "Target"),
-    ]:
+        (res["target"], "dot", "purple", "Target 2 (2R)"),
+    ]
+    if res.get("t1_struct"):
+        plan_lines.append((res["t1_struct"], "dot", "#9467bd", "Target 1"))
+    for y, dash, color, label in plan_lines:
         fig.add_hline(y=y, line_dash=dash, line_color=color,
                       annotation_text=label, row=1, col=1)
 
@@ -1463,7 +2599,7 @@ def render_chart(ticker, res):
     fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=bar_colors,
                          name="Volume", showlegend=False), row=2, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=avg20, name="20-day avg vol",
-                             line=dict(color="black", width=1.2)), row=2, col=1)
+                             line=dict(color="#888", width=1.2)), row=2, col=1)
 
     # ---- Darvas box (ceiling / floor) drawn as a shaded rectangle ----
     box = res.get("box")
@@ -1488,12 +2624,12 @@ def render_chart(ticker, res):
                            yshift=10, font=dict(color="green", size=11), row=1, col=1)
 
     title_suffix = "Darvas Box" if box else "Pivot High"
-    fig.update_layout(height=760, xaxis_rangeslider_visible=False,
+    fig.update_layout(height=560, xaxis_rangeslider_visible=False,
                       title=f"{ticker} Breakout Scanner ({title_suffix})",
                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 # ---------- SINGLE MODE ----------
@@ -1501,20 +2637,23 @@ if mode == "Single ticker (detailed)":
     wl = get_watchlist()
     pick = st.selectbox("Pick from watchlist", ["— type below —"] + wl)
     typed = st.text_input("…or enter a Yahoo Finance ticker", value="RELIANCE.NS",
-                          help="Bare NSE symbols auto-get '.NS' (e.g. TCS → TCS.NS). "
-                               "Use a suffix for other exchanges (e.g. .BO for BSE) "
-                               "or ^ for indices (e.g. ^NSEI).")
-    ticker = normalize_ticker(typed) if pick == "— type below —" else pick
+                          help="Bare symbols get an exchange suffix per the sidebar "
+                               "preference (default: NSE first, BSE fallback if NSE "
+                               "has no data). Force an exchange with a suffix — "
+                               ".NS = NSE, .BO = BSE (e.g. 500325.BO) — or use ^ for "
+                               "indices (^NSEI, ^BSESN).")
+    ticker = normalize_ticker(typed, cfg["exchange"]) if pick == "— type below —" else pick
     if pick == "— type below —" and ticker and ticker != typed.strip().upper():
-        st.caption(f"🔎 Resolved to **{ticker}** (NSE).")
+        exch = "BSE" if ticker.endswith(".BO") else "NSE"
+        st.caption(f"🔎 Resolved to **{ticker}** ({exch}).")
 
     ca, cb = st.columns(2)
-    if ca.button("Analyze"):
+    if ca.button("Analyze", type="primary", use_container_width=True):
         st.session_state["analyzed"] = True
         st.session_state["ticker"] = ticker
         st.session_state["run_bt"] = False          # reset backtest on new analysis
-    if cb.button("➕ Add to watchlist"):
-        t = normalize_ticker(ticker)
+    if cb.button("➕ Add to watchlist", use_container_width=True):
+        t = resolve_ticker(ticker, cfg["exchange"])
         if t and t not in wl:
             set_watchlist(wl + [t])
             st.success(f"Added **{t}** to your watchlist.")
@@ -1528,7 +2667,11 @@ if mode == "Single ticker (detailed)":
         if "error" in res:
             st.error(res["error"])
         else:
-            render_single(tk, res, cfg)
+            tk_used = res.get("ticker", tk)
+            if tk_used != tk:
+                st.caption(f"ℹ️ No data for **{tk}** — using its exchange twin "
+                           f"**{tk_used}** instead.")
+            render_single(tk_used, res, cfg)
 
 # ---------- SCAN MODE ----------
 else:
@@ -1540,15 +2683,19 @@ else:
         value="RELIANCE.NS, TCS.NS, INFY.NS, HDFCBANK.NS, ICICIBANK.NS",
         height=100, disabled=use_wl,
     )
-    if st.button("Scan"):
+    if st.button("Scan", type="primary", use_container_width=True):
         tickers = wl if use_wl else [
-            normalize_ticker(t) for t in raw.replace("\n", ",").split(",") if t.strip()]
+            normalize_ticker(t, cfg["exchange"])
+            for t in raw.replace("\n", ",").split(",") if t.strip()]
         if not tickers:
             st.warning("No tickers to scan — add some to the box or your watchlist.")
             st.stop()
         rows, progress = [], st.progress(0.0)
         for i, tk in enumerate(tickers, 1):
-            res = analyze(tk, cfg)
+            try:
+                res = analyze(tk, cfg)
+            except Exception as e:          # one bad ticker must not kill the scan
+                res = {"error": f"analysis failed ({type(e).__name__}: {e})"}
             if "error" in res:
                 rows.append({"Ticker": tk, "Score": None, "Signal": "⚠️ " + res["error"]})
             else:
@@ -1566,16 +2713,30 @@ else:
                 else:
                     my_dist, my_base = None, "—"
 
+                rt = res.get("retest")
+                if rt:
+                    rt_emo = {"triggered": "✅", "at_retest": "🎯",
+                              "pulling_back": "💧", "extended": "⏳",
+                              "failed": "❌", "ran_away": "🏃"}.get(
+                                  rt["st"]["state"], "")
+                    rt_col = f"{rt_emo} {rt['score']}"
+                    rt_dist = round(rt["st"]["dist_pct"], 2)
+                else:
+                    rt_col, rt_dist = "—", None
+
                 rows.append({
-                    "Ticker": tk,
+                    "Ticker": res.get("ticker", tk),   # twin fallback may rename
                     "Score": res["score"],
-                    "Signal": res["signal"],
+                    "Signal": res["signal"] + ("" if res["liquid"] else " ⚠️ illiquid"),
                     "Breakout?": "🚀" if res["confirmed"] else "",
+                    "RT": rt_col,
+                    "RT Dist %": rt_dist,
                     "MY Base": my_base,
                     "MY Dist %": my_dist,
                     "Vol ×avg": round(vol_ratio, 2) if vol_ratio is not None else None,
                     "Today Vol": round(res["last_vol"]),
                     "20d Avg Vol": round(res["avg_vol"]),
+                    "Turnover ₹Cr": round(res["turnover_cr"], 1),
                     "Price": round(res["price"], 2),
                     "Resistance": round(res["resistance"], 2),
                     "Dist %": round(res["dist_pct"], 2),
@@ -1593,10 +2754,11 @@ else:
 
         table = pd.DataFrame(rows)
         # enforce a stable column order (Breakout? before Price; %s beside levels)
-        col_order = ["Ticker", "Score", "Signal", "Breakout?", "MY Base", "MY Dist %",
-                     "Vol ×avg", "Today Vol", "20d Avg Vol", "Price", "Resistance",
-                     "Dist %", "Dist pts", "Entry", "Stop", "Stop %", "Target",
-                     "Target %", "Base len", "Base depth %"]
+        col_order = ["Ticker", "Score", "Signal", "Breakout?", "RT", "RT Dist %",
+                     "MY Base", "MY Dist %", "Vol ×avg", "Turnover ₹Cr", "Today Vol",
+                     "20d Avg Vol", "Price", "Resistance", "Dist %", "Dist pts",
+                     "Entry", "Stop", "Stop %", "Target", "Target %", "Base len",
+                     "Base depth %"]
         table = table.reindex(columns=[c for c in col_order if c in table.columns])
         if "Score" in table:
             table = table.sort_values(
@@ -1622,6 +2784,20 @@ else:
                    "👀 testing / `N×` = touch count / `—` none. **MY Dist %** = distance to that "
                    "ceiling (smaller = nearer; negative = already above). Sort by **MY Dist %** to "
                    "find stocks closest to a multi-year breakout.")
+        st.caption("**RT** = retest state + retest score: 🎯 in the retest zone / ✅ bounce "
+                   "triggered today / 💧 pulling back / ⏳ extended / ❌ failed / 🏃 ran away / "
+                   "`—` no fresh breakout. **RT Dist %** = distance to the frozen broken level "
+                   "(− = below it). 🎯 and ✅ rows are today's actionable retests — see the "
+                   "💧 Retest tab in the drill-down.")
+
+        # compact view: only the decision-making columns (mobile-friendly);
+        # click a row for everything else.
+        compact = st.toggle("📱 Compact view (key columns only — best on mobile)",
+                            value=True)
+        if compact:
+            keep = ["Ticker", "Score", "Signal", "Breakout?", "RT", "RT Dist %",
+                    "MY Base", "MY Dist %", "Vol ×avg", "Turnover ₹Cr"]
+            table = table[[c for c in keep if c in table.columns]]
 
         # tidy decimals everywhere; red Stop %, green Target %. Selection still works.
         fmt_map = {}
@@ -1630,7 +2806,8 @@ else:
                 fmt_map[c] = "{:.2f}"
         for c, f in {"Dist %": "{:+.2f}%", "Stop %": "{:+.2f}%",
                      "Target %": "{:+.2f}%", "Base depth %": "{:.1f}%",
-                     "MY Dist %": "{:+.2f}%", "Vol ×avg": "{:.1f}×"}.items():
+                     "MY Dist %": "{:+.2f}%", "RT Dist %": "{:+.2f}%",
+                     "Vol ×avg": "{:.1f}×", "Turnover ₹Cr": "{:,.1f}"}.items():
             if c in table:
                 fmt_map[c] = f
         for c in ["Score", "Base len", "Today Vol", "20d Avg Vol"]:
@@ -1670,4 +2847,4 @@ else:
             if "error" in dres:
                 st.error(dres["error"])
             else:
-                render_single(sel_ticker, dres, cfg)
+                render_single(dres.get("ticker", sel_ticker), dres, cfg)
