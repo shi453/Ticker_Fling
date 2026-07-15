@@ -84,6 +84,26 @@ CONFIG = {
     "rw_hi52": 5,
 }
 
+# =====================================================================
+# PORTFOLIO (v3) — your open swing positions.
+# Streamlit Cloud has NO persistent disk, so this list in the code IS the
+# permanent storage when deployed: edit it here and push to GitHub.
+# Positions added on the 📔 Positions page last only for the browser
+# session — that page can generate this block for you to paste back here.
+#   stop   = your INITIAL stop (R-multiples are measured against it).
+#            None = auto-reconstruct (buy − 1.5×ATR as of the buy date).
+#   target = your target. None = auto 2R (buy + 2 × initial risk).
+# ⚠️ EXAMPLE fills below — replace qty/date/price with your real trades.
+# =====================================================================
+PORTFOLIO = [
+    {"ticker": "SAILIFE.NS", "qty": 40, "buy_date": "2026-07-01",
+     "buy_price": 1250, "stop": 1200, "target": 1352},
+    {"ticker": "DELHIVERY.NS", "qty": 100, "buy_date": "2026-07-02",
+     "buy_price": 504.75, "stop": 482, "target": None},
+    {"ticker": "NORTHARC.NS", "qty": 156, "buy_date": "2026-07-14",
+     "buy_price": 320.5, "stop": 300, "target": None},
+]
+
 # Plain-English explanation for every checklist item.
 EXPLANATIONS = {
     "Trend": "Price is above EMA20, and EMA20 > EMA50 > EMA200. This 'stacked' "
@@ -1307,7 +1327,7 @@ def analyze(ticker, cfg):
 # =====================================================================
 st.sidebar.header("⚙️ Settings")
 
-if st.sidebar.button("🔄 Clear cache & refresh data", use_container_width=True,
+if st.sidebar.button("🔄 Clear cache & refresh data", width="stretch",
                      help="Discards cached prices/fundamentals so the next analysis "
                           "re-downloads fresh data from Yahoo Finance."):
     st.cache_data.clear()
@@ -1463,7 +1483,8 @@ st.caption("v3: everything in v2 + 💧 **Retest mode** — buy the pullback to 
 
 mc1, mc2 = st.columns([3, 2])
 with mc1:
-    mode = st.radio("Mode", ["Single ticker (detailed)", "Scan multiple"], horizontal=True)
+    mode = st.radio("Mode", ["Single ticker (detailed)", "Scan multiple",
+                             "📔 Positions"], horizontal=True)
 with mc2:
     cfg["box_method"] = st.selectbox(
         "Box / resistance method", ["Pivot High", "Darvas Box"],
@@ -1879,7 +1900,7 @@ def render_long_base(res, cfg):
                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
 # ----- retest view (v3) -----
@@ -1955,7 +1976,7 @@ def render_retest(ticker, res, cfg):
 
     g1, g2 = st.columns([1, 2])
     with g1:
-        st.plotly_chart(score_gauge(rt["score"]), use_container_width=True,
+        st.plotly_chart(score_gauge(rt["score"]), width="stretch",
                         config={"displayModeBar": False}, key="rt_gauge")
     with g2:
         st.write("#### 🎯 Retest Trade Plan")
@@ -2029,7 +2050,7 @@ def render_retest(ticker, res, cfg):
                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
 # =====================================================================
@@ -2306,7 +2327,7 @@ def render_verdict(ticker, res, cfg):
                 "Avg R": round(sum(t["r"] for t in sel) / len(sel), 2) if sel else None,
             })
         st.dataframe(pd.DataFrame(rows).style.format(na_rep="—", precision=2),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
         st.caption("Every confirmed breakout in the lookback (no score threshold), "
                    "bucketed by its as-of score. Win rate rising down the table = "
                    "the score is informative on this stock; flat = it isn't. Small "
@@ -2352,7 +2373,7 @@ def render_single(ticker, res, cfg):
         "pivot is found, we fall back to the highest High of the last 120 bars.")
     gcol, mcol = st.columns([1, 2])
     with gcol:
-        st.plotly_chart(score_gauge(res["score"]), use_container_width=True,
+        st.plotly_chart(score_gauge(res["score"]), width="stretch",
                         config={"displayModeBar": False})
     with mcol:
         m1, m2, m3 = st.columns(3)
@@ -2504,7 +2525,7 @@ def render_backtest(ticker, res, cfg):
              "next open. Retest waits for a pullback into the zone and a strong-close "
              "bounce bar — it misses moves that never pull back, but dodges breakouts "
              "that fail before triggering. Compare them on R/signal.")
-    if st.button("Run backtest", type="primary", use_container_width=True):
+    if st.button("Run backtest", type="primary", width="stretch"):
         st.session_state["run_bt"] = True
     if not st.session_state.get("run_bt"):
         return
@@ -2545,7 +2566,7 @@ def render_backtest(ticker, res, cfg):
             _policy_row("💧 Retest (wait for pullback)", bt_rt),
         ])
         st.dataframe(comp.style.format(na_rep="—", precision=2),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
         a_rs = bt.get("r_per_signal", 0.0)
         b_rs = bt_rt.get("r_per_signal", 0.0)
         if b_rs > a_rs:
@@ -2629,7 +2650,410 @@ def render_chart(ticker, res):
                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+
+# =====================================================================
+# POSITIONS (v3) — manage open swing trades in R-multiples
+# =====================================================================
+def get_positions():
+    """Session positions, seeded once from the hardcoded PORTFOLIO list."""
+    if "positions" not in st.session_state:
+        st.session_state["positions"] = [dict(p) for p in PORTFOLIO]
+    return st.session_state["positions"]
+
+
+def position_snapshot(pos, cfg):
+    """P&L, R-multiple, stop/target (user's, else reconstructed as of the buy
+    date — same stateless as-of technique as the retest engine) for one
+    position. Returns a dict, or {'error': ...}."""
+    res = analyze(pos["ticker"], cfg)
+    if "error" in res:
+        return {"error": res["error"], "ticker": pos["ticker"]}
+    df = res["df"]
+    buy_ts = pd.Timestamp(pos["buy_date"])
+    price = float(df["Close"].iloc[-1])
+    buy = float(pos["buy_price"])
+    qty = int(pos["qty"])
+    held = int((df.index >= buy_ts).sum())
+
+    stop = pos.get("stop") or None
+    stop_src = "your stop"
+    if not stop:
+        asof = df.loc[:buy_ts]
+        if len(asof) >= 20 and not pd.isna(asof["ATR14"].iloc[-1]):
+            stop = buy - 1.5 * float(asof["ATR14"].iloc[-1])
+            stop_src = "auto: buy − 1.5×ATR as of the buy date"
+        else:
+            stop = buy * 0.95
+            stop_src = "auto fallback: buy − 5%"
+    stop = float(stop)
+    risk_ps = buy - stop
+    r_mult = (price - buy) / risk_ps if risk_ps > 0 else None
+
+    target = pos.get("target") or None
+    tgt_src = "your target"
+    if not target:
+        target = buy + 2 * risk_ps if risk_ps > 0 else None
+        tgt_src = "auto: 2R (buy + 2 × initial risk)"
+
+    return {"res": res, "df": df, "ticker": res.get("ticker", pos["ticker"]),
+            "price": price, "buy": buy, "qty": qty, "buy_ts": buy_ts, "held": held,
+            "stop": stop, "stop_src": stop_src, "risk_ps": risk_ps,
+            "target": float(target) if target else None, "tgt_src": tgt_src,
+            "pnl": (price - buy) * qty, "pnl_pct": (price / buy - 1) * 100,
+            "r_mult": r_mult}
+
+
+def position_verdict(p, cfg, regime, earnings_days):
+    """Management rules for an OPEN position -> one action with visible
+    factors. Works on closes and in R-multiples, mirroring the entry system."""
+    res, df = p["res"], p["df"]
+    price, buy, stop = p["price"], p["buy"], p["stop"]
+    r, target = p["r_mult"], p["target"]
+    ema20 = float(df["EMA20"].iloc[-1])
+    atr = 0.0 if pd.isna(res["atr"]) else float(res["atr"])
+    since = df.loc[df.index >= p["buy_ts"], "Close"]
+    hi_close = float(since.max()) if len(since) else price
+    trend_ok = res["checklist"].get("Trend", {}).get("passed", False)
+    rt = res.get("retest")
+    rt_state = rt["st"]["state"] if rt else None
+    live_fail = rt_state == "failed" and rt["st"].get("dist_pct", 0.0) <= 1.0
+    risk_on = bool(regime and regime["risk_on"])
+    horizon = int(cfg.get("bt_horizon", 20))
+    dead = p["held"] >= horizon and r is not None and r < 0.5
+
+    factors = []
+
+    def add(status, label, detail):
+        factors.append({"status": status, "label": label, "detail": detail})
+
+    if price > stop:
+        add("pass", "Stop", f"price is {(price - stop) / stop * 100:.1f}% above the "
+                            f"stop {stop:.2f}")
+    else:
+        add("fail", "Stop", f"CLOSED at/below the stop {stop:.2f}")
+    if r is not None:
+        add("pass" if r > 0 else "warn", "Progress",
+            f"{r:+.2f}R · {p['pnl_pct']:+.1f}% · {p['held']} bar(s) held")
+    else:
+        add("warn", "Progress",
+            f"{p['pnl_pct']:+.1f}% · {p['held']} bar(s) held (stop ≥ buy price, so "
+            f"R has no basis — enter your INITIAL stop for R tracking)")
+    if trend_ok and price >= ema20:
+        add("pass", "Trend", "EMA stack intact, price above EMA20")
+    elif price < ema20:
+        add("warn", "Trend", f"closed below EMA20 ({ema20:.2f}) — momentum cooling")
+    else:
+        add("warn", "Trend", "EMA stack broken")
+    if live_fail:
+        add("fail", "Thesis", "the breakout level behind this trade has FAILED "
+                              "(close back below it)")
+    elif rt_state == "failed":
+        add("warn", "Thesis", "an earlier break failed but was reclaimed — watch it")
+    else:
+        add("pass", "Thesis", "no failure signal from the level engine")
+    add("pass" if risk_on else "warn", "Regime",
+        "RISK-ON" if risk_on else "RISK-OFF — winners get sold in weak tapes; "
+                                  "favour tighter stops")
+    if earnings_days is not None and earnings_days <= 5:
+        add("fail", "Earnings", f"in {earnings_days} day(s) — holding a swing trade "
+                                f"through earnings is a coin-flip")
+    elif earnings_days is not None and earnings_days <= 10:
+        add("warn", "Earnings", f"in {earnings_days} day(s)")
+    else:
+        add("pass" if earnings_days else "warn", "Earnings",
+            f"{earnings_days} days away" if earnings_days else
+            "date unknown — check manually")
+    add("warn" if dead else "pass", "Time",
+        f"{p['held']} bars for {r:+.2f}R — dead money by the backtest's own "
+        f"{horizon}-bar horizon" if dead else f"{p['held']} of ~{horizon} bars")
+
+    sug_stop = None
+    if price <= stop:
+        code, emoji, kind = "EXIT — STOP HIT", "⛔", "error"
+        advice = ("Price closed at/below your stop. Exit — the stop is the system; "
+                  "overriding it is how small losses become big ones.")
+    elif live_fail:
+        code, emoji, kind = "EXIT — THESIS DEAD", "🔴", "error"
+        advice = ("The breakout that justified this trade has failed (close back "
+                  "below the level). Exit even though the stop hasn't hit — the "
+                  "reason you bought no longer exists.")
+    elif dead:
+        code, emoji, kind = "EXIT — DEAD MONEY", "⏰", "warning"
+        advice = (f"{p['held']} bars for {r:+.2f}R. The backtest resolves trades in "
+                  f"~{horizon} bars — capital parked in a non-mover has opportunity "
+                  f"cost. Consider rotating out.")
+    elif r is not None and r >= 2:
+        cands = [c for c in (stop, buy, ema20, hi_close - 2.5 * atr) if c < price]
+        sug_stop = max(cands) if cands else stop
+        code, emoji, kind = "TRAIL", "🏃", "success"
+        advice = (f"Past +2R — the trade has paid. Trail the stop (suggested "
+                  f"{sug_stop:.2f} — the highest of breakeven, EMA20 and a 2.5×ATR "
+                  f"chandelier) and let the rest run.")
+    elif (target is not None and price >= target) or (r is not None and r >= 1):
+        sug_stop = max(stop, buy)
+        why = ("target reached" if (target is not None and price >= target)
+               else "+1R reached")
+        code, emoji, kind = "BOOK PARTIAL", "🎯", "success"
+        advice = (f"{why.capitalize()} — book ⅓–½ of the position and move the stop "
+                  f"to breakeven ({sug_stop:.2f}). Trail the remainder.")
+    elif ((not risk_on) or price < ema20 or (not trend_ok)
+          or (earnings_days is not None and earnings_days <= 5)):
+        reasons = []
+        if not risk_on:
+            reasons.append("risk-off regime")
+        if price < ema20:
+            reasons.append("close below EMA20")
+        if not trend_ok:
+            reasons.append("trend stack broken")
+        if earnings_days is not None and earnings_days <= 5:
+            reasons.append(f"earnings in {earnings_days}d")
+        code, emoji, kind = "TIGHTEN", "⚠️", "warning"
+        advice = ("Thesis intact but conditions are degrading (" +
+                  ", ".join(reasons) + "). Consider raising the stop toward the "
+                  "recent swing low / breakeven rather than exiting outright.")
+    else:
+        code, emoji, kind = "HOLD", "✅", "info"
+        advice = ("Above the stop, trend intact, nothing actionable — the correct "
+                  "move is to do nothing and let the trade work.")
+    return {"code": code, "emoji": emoji, "kind": kind, "advice": advice,
+            "factors": factors, "sug_stop": sug_stop}
+
+
+def render_positions(cfg):
+    st.write("### 📔 Positions — manage what you hold")
+    st.caption("Positions are measured in **R-multiples** (profit ÷ initial risk) — "
+               "the same language as the entry plans and the backtest. All rules "
+               "work on CLOSES. Decision support, not investment advice.")
+    render_regime(cfg)
+
+    with st.expander("ℹ️ What are R (the R-multiple) and portfolio heat?"):
+        st.markdown(
+            "**R measures every trade in units of what you risked**, instead of "
+            "rupees or percent.\n\n"
+            "- **1R (your initial risk)** = buy price − initial stop, per share. "
+            "Bought at 705.45 with a stop at 677.46 → 1R = ₹27.99/share.\n"
+            "- **R-multiple** = (current price − buy price) ÷ 1R. A ₹56/share "
+            "profit on that trade = **+2.0R**; a close at the stop = **−1.0R**.\n\n"
+            "Why bother? Because R makes trades **comparable and honest**: a +4% "
+            "move can be a great trade (tight stop) or a mediocre one (wide stop). "
+            "It also plugs straight into position sizing — if you size every trade "
+            "so 1R = 1% of capital (the ⚖️ sizing in the Verdict tab does exactly "
+            "this), every R value reads directly as % of capital gained or lost. "
+            "And it's the language the rest of this tool already speaks: the plans "
+            "target **2R**, the backtest reports expectancy in **R per trade**.\n\n"
+            "| R value | What it means | Playbook |\n"
+            "|---|---|---|\n"
+            "| **−1R** | Full planned loss — the stop was hit | Exit; this is the "
+            "designed worst case (only a gap can exceed it) |\n"
+            "| **−0.5R** | Halfway to the stop | Normal noise — no action; the "
+            "stop decides, not your nerves |\n"
+            "| **0R** | Breakeven | Nothing yet — most trades pass through here "
+            "more than once |\n"
+            "| **+0.5R** | Small progress | Fine early on; after ~20 bars it's "
+            "'dead money' territory |\n"
+            "| **+1R** | Made what you risked | 🎯 Book ⅓–½, stop to breakeven — "
+            "the trade is now 'free' |\n"
+            "| **+2R** | The backtested target | 🏃 Trail the stop; let the rest "
+            "run |\n"
+            "| **+3R and up** | Outlier winner | These pay for all the −1R losers "
+            "— never cut them short |\n\n"
+            "The arithmetic of why this works: with +2R winners and −1R losers you "
+            "only need to win **~34%** of the time to break even; a 45% win rate "
+            "earns about **+0.35R per trade**.\n\n"
+            "⚠️ Two rules: R is always measured against your **initial** stop — "
+            "don't recompute it after trailing, or your statistics lie. And a "
+            "stop-loss order actually placed with the broker is what makes −1R "
+            "the true worst case.\n\n"
+            "---\n\n"
+            "**Portfolio heat** — R manages one trade; heat manages all of them "
+            "together.\n\n"
+            "Heat = **Σ (current price − stop) × quantity** across your open "
+            "positions — the total ₹ you would lose *from here* if **every stop "
+            "were hit at once**. The **Capital** input below exists solely to "
+            "express that as a percentage (it isn't stored or used for anything "
+            "else).\n\n"
+            "- It uses the **current** price, not your buy price: a position whose "
+            "stop has been moved to breakeven contributes ~zero heat even though "
+            "it's still open — locked-in profit isn't at risk.\n"
+            "- **Guideline: keep total heat under ~5% of capital** (roughly five "
+            "positions each risking 1%). Above that, one bad market day dents the "
+            "account instead of a single trade.\n"
+            "- Why 'all stops at once' is the right stress test: breakout longs are "
+            "**correlated** — in a market sell-off they tend to hit their stops "
+            "together, not one at a time. That's also why this page warns when you "
+            "hold several longs in a RISK-OFF regime: they behave like one big "
+            "market bet.\n\n"
+            "In short: **R answers 'how is this trade going?'; heat answers 'how "
+            "bad is my worst normal week?'** Keep each trade near 1R of risk and "
+            "the total under ~5%, and no single outcome can hurt you seriously.")
+
+    positions = get_positions()
+
+    with st.expander("➕ Add a position (session-only on the cloud)",
+                     expanded=not positions):
+        with st.form("pos_add", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            p_t = c1.text_input("Ticker", placeholder="e.g. UNIPARTS or TCS.NS")
+            p_q = c2.number_input("Quantity", 1, 1_000_000, 10, 1)
+            c3, c4 = st.columns(2)
+            p_d = c3.date_input("Buy date", value=pd.Timestamp.today().date(),
+                                max_value=pd.Timestamp.today().date())
+            p_p = c4.number_input("Buy price", 0.0, 1e7, 0.0, 0.05)
+            c5, c6 = st.columns(2)
+            p_s = c5.number_input("Initial stop (0 = auto)", 0.0, 1e7, 0.0, 0.05,
+                                  help="Your INITIAL stop — R is measured against "
+                                       "it. 0 = reconstruct buy − 1.5×ATR as of the "
+                                       "buy date.")
+            p_g = c6.number_input("Target (0 = auto 2R)", 0.0, 1e7, 0.0, 0.05)
+            if st.form_submit_button("Add position", type="primary",
+                                     width="stretch"):
+                t = resolve_ticker(p_t, cfg["exchange"])
+                if not t or p_p <= 0:
+                    st.warning("Ticker and buy price are required.")
+                else:
+                    positions.append({"ticker": t, "qty": int(p_q),
+                                      "buy_date": str(p_d),
+                                      "buy_price": float(p_p),
+                                      "stop": float(p_s) or None,
+                                      "target": float(p_g) or None})
+                    st.session_state["positions"] = positions
+                    st.rerun()
+
+    if not positions:
+        st.info("No positions. Add one above — or hardcode your fills in the "
+                "PORTFOLIO list near the top of this file (Streamlit Cloud has no "
+                "persistent storage, so on the cloud the code IS the storage).")
+        return
+
+    capital = st.number_input(
+        "Capital (₹) — for portfolio heat", 10000.0, 1e10, 500000.0, 50000.0,
+        key="pf_cap",
+        help="Your total trading capital. Used for ONE calculation only: expressing "
+             "portfolio heat — what you'd lose from here if every stop were hit — "
+             "as a % of capital. Guideline: keep total heat under ~5%. Not stored "
+             "anywhere. See the ℹ️ expander above for the full explanation.")
+
+    regime = market_regime(cfg["benchmark"])
+    snaps, prog = [], st.progress(0.0)
+    for i, pos in enumerate(positions, 1):
+        try:
+            s = position_snapshot(pos, cfg)
+        except Exception as e:      # one bad position must not kill the page
+            s = {"error": f"{type(e).__name__}: {e}",
+                 "ticker": pos.get("ticker", "?")}
+        if "error" not in s:
+            ed = next_earnings_date(s["ticker"])
+            edays = None
+            if ed is not None:
+                edays = int((pd.Timestamp(ed).normalize()
+                             - pd.Timestamp.today().normalize()).days)
+                if edays < 0:
+                    edays = None
+            s["verdict"] = position_verdict(s, cfg, regime, edays)
+        snaps.append(s)
+        prog.progress(i / len(positions))
+    prog.empty()
+
+    ok = [s for s in snaps if "error" not in s]
+    if ok:
+        cost = sum(s["buy"] * s["qty"] for s in ok)
+        value = sum(s["price"] * s["qty"] for s in ok)
+        heat = sum(max(0.0, s["price"] - s["stop"]) * s["qty"] for s in ok)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Invested", f"₹{cost:,.0f}")
+        m2.metric("Current value", f"₹{value:,.0f}",
+                  delta=f"{value - cost:+,.0f} "
+                        f"({(value / cost - 1) * 100 if cost else 0:+.1f}%)")
+        m3.metric("Open risk (heat)", f"₹{heat:,.0f}",
+                  delta=f"{heat / capital * 100 if capital else 0:.1f}% of capital",
+                  delta_color="off",
+                  help="What you lose from HERE if every stop is hit — the number "
+                       "that says whether you're overexposed.")
+        m4.metric("Positions", len(ok))
+        if capital and heat / capital > 0.05:
+            st.warning(f"🔥 Open risk is {heat / capital * 100:.1f}% of capital — "
+                       f"above the ~5% total-heat guideline. Tighten stops or trim.")
+        if not (regime and regime["risk_on"]) and len(ok) >= 2:
+            st.warning("⚠️ Multiple long breakout positions in a RISK-OFF regime are "
+                       "effectively ONE market bet, not diversified trades.")
+
+    # ---- overview table ----
+    rows = []
+    for s in snaps:
+        if "error" in s:
+            rows.append({"Ticker": s["ticker"], "Action": "⚠️ " + s["error"]})
+            continue
+        v = s["verdict"]
+        rows.append({
+            "Ticker": s["ticker"], "Action": f"{v['emoji']} {v['code']}",
+            "R": round(s["r_mult"], 2) if s["r_mult"] is not None else None,
+            "P&L %": round(s["pnl_pct"], 2), "P&L ₹": round(s["pnl"]),
+            "Qty": s["qty"], "Buy": round(s["buy"], 2),
+            "LTP": round(s["price"], 2), "Stop": round(s["stop"], 2),
+            "To stop %": round((s["stop"] / s["price"] - 1) * 100, 1),
+            "Target": round(s["target"], 2) if s["target"] else None,
+            "Days": s["held"],
+        })
+    st.dataframe(pd.DataFrame(rows).style.format(na_rep="—", precision=2),
+                 hide_index=True, width="stretch")
+    st.caption("**R** = profit ÷ initial risk (buy − initial stop). Negative R = "
+               "on the way to the stop (−1R = stop hit, the full planned loss); "
+               "positive R = multiples of your risk earned (+1R → book partial, "
+               "+2R → trail). Full guide in the ℹ️ expander above.")
+
+    # ---- per-position cards ----
+    icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}
+    for s in snaps:
+        if "error" in s:
+            st.error(f"{s['ticker']}: {s['error']}")
+            continue
+        v = s["verdict"]
+        rr = f"{s['r_mult']:+.2f}R" if s["r_mult"] is not None else "—R"
+        title = (f"{v['emoji']} {s['ticker']} · {v['code']} · {rr} · "
+                 f"{s['pnl_pct']:+.1f}% · ₹{s['pnl']:+,.0f}")
+        with st.expander(title, expanded=False):
+            {"info": st.info, "success": st.success, "warning": st.warning,
+             "error": st.error}[v["kind"]](f"**{v['code']}** — {v['advice']}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Buy", fmt(s["buy"]),
+                      help=f"{s['qty']} shares on {s['buy_ts']:%d %b %Y}")
+            c2.metric("LTP", fmt(s["price"]), delta=f"{s['pnl_pct']:+.1f}%")
+            c3.metric("Stop", fmt(s["stop"]), help=s["stop_src"])
+            c4.metric("Target", fmt(s["target"]), help=s["tgt_src"])
+            if v["sug_stop"] and v["sug_stop"] > s["stop"]:
+                st.info(f"⬆️ Suggested stop now: **{v['sug_stop']:.2f}** "
+                        f"(vs your {s['stop']:.2f}).")
+            for f in v["factors"]:
+                st.write(f"{icon[f['status']]} **{f['label']}** — {f['detail']}")
+            st.caption(f"Stop basis: {s['stop_src']} · Target basis: {s['tgt_src']} "
+                       f"· Initial risk/share {s['risk_ps']:.2f} · Open "
+                       f"**{s['ticker']}** in Single mode for the full analysis.")
+
+    # ---- remove + persist-to-code ----
+    with st.expander("🗑 Remove positions / 💾 make the list permanent"):
+        labels = [f"{i + 1}. {p['ticker']} — {p['qty']} @ {p['buy_price']}"
+                  for i, p in enumerate(positions)]
+        rem = st.multiselect("Remove", labels, key="pf_rem")
+        if st.button("Remove selected", key="pf_rem_btn") and rem:
+            drop = {labels.index(x) for x in rem}
+            st.session_state["positions"] = [
+                p for i, p in enumerate(positions) if i not in drop]
+            st.rerun()
+        st.caption("💾 Streamlit Cloud wipes the session, so to keep this list, "
+                   "copy the block below over the PORTFOLIO list near the top of "
+                   "Breakout_checker_v3.py and push to GitHub — the code is the "
+                   "storage.")
+        lines = ["PORTFOLIO = ["]
+        for p in positions:
+            lines.append(
+                f'    {{"ticker": "{p["ticker"]}", "qty": {p["qty"]}, '
+                f'"buy_date": "{p["buy_date"]}", "buy_price": {p["buy_price"]}, '
+                f'"stop": {p.get("stop") if p.get("stop") else None}, '
+                f'"target": {p.get("target") if p.get("target") else None}}},')
+        lines.append("]")
+        st.code("\n".join(lines), language="python")
 
 
 # ---------- SINGLE MODE ----------
@@ -2648,11 +3072,11 @@ if mode == "Single ticker (detailed)":
         st.caption(f"🔎 Resolved to **{ticker}** ({exch}).")
 
     ca, cb = st.columns(2)
-    if ca.button("Analyze", type="primary", use_container_width=True):
+    if ca.button("Analyze", type="primary", width="stretch"):
         st.session_state["analyzed"] = True
         st.session_state["ticker"] = ticker
         st.session_state["run_bt"] = False          # reset backtest on new analysis
-    if cb.button("➕ Add to watchlist", use_container_width=True):
+    if cb.button("➕ Add to watchlist", width="stretch"):
         t = resolve_ticker(ticker, cfg["exchange"])
         if t and t not in wl:
             set_watchlist(wl + [t])
@@ -2674,7 +3098,7 @@ if mode == "Single ticker (detailed)":
             render_single(tk_used, res, cfg)
 
 # ---------- SCAN MODE ----------
-else:
+elif mode == "Scan multiple":
     wl = get_watchlist()
     use_wl = st.checkbox(f"Scan my watchlist ({len(wl)} stocks)",
                          value=bool(wl), disabled=not wl)
@@ -2683,7 +3107,7 @@ else:
         value="RELIANCE.NS, TCS.NS, INFY.NS, HDFCBANK.NS, ICICIBANK.NS",
         height=100, disabled=use_wl,
     )
-    if st.button("Scan", type="primary", use_container_width=True):
+    if st.button("Scan", type="primary", width="stretch"):
         tickers = wl if use_wl else [
             normalize_ticker(t, cfg["exchange"])
             for t in raw.replace("\n", ",").split(",") if t.strip()]
@@ -2832,7 +3256,7 @@ else:
         if fmt_map:
             styler = styler.format(fmt_map, na_rep="—")
 
-        event = st.dataframe(styler, use_container_width=True, hide_index=True,
+        event = st.dataframe(styler, width="stretch", hide_index=True,
                              on_select="rerun", selection_mode="single-row", key="scan_df")
         sel = event.selection.rows if (event and event.selection) else []
         if sel:
@@ -2848,3 +3272,7 @@ else:
                 st.error(dres["error"])
             else:
                 render_single(dres.get("ticker", sel_ticker), dres, cfg)
+
+# ---------- POSITIONS MODE ----------
+else:
+    render_positions(cfg)
