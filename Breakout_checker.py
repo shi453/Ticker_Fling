@@ -560,15 +560,53 @@ def _gh_headers(conf):
             "X-GitHub-Api-Version": "2022-11-28"}
 
 
+def gh_repo_info(conf):
+    """GET the repository itself. This exists to tell two identical-looking
+    404s apart: 'the file isn't created yet' (fine) vs 'this token cannot see
+    the repo' (fatal). GitHub deliberately returns 404 — not 403 — for private
+    repos a token has no access to, so the file call alone can't distinguish
+    them. Returns (info_dict, error)."""
+    try:
+        r = requests.get(f"https://api.github.com/repos/{conf['repo']}",
+                         headers=_gh_headers(conf), timeout=20)
+    except Exception as e:
+        return None, f"network error: {type(e).__name__}"
+    if r.status_code == 200:
+        try:
+            return r.json(), None
+        except Exception:
+            return {}, None
+    if r.status_code == 404:
+        return None, (f"repo '{conf['repo']}' is not visible to this token. "
+                      f"Either the owner/name is wrong, or the token doesn't "
+                      f"list this repo under 'Repository access' (GitHub returns "
+                      f"404, not 403, for repos a token can't see). If the repo "
+                      f"belongs to an organisation, the token may also be "
+                      f"awaiting admin approval.")
+    if r.status_code in (401, 403):
+        return None, (f"auth failed ({r.status_code}) — the token is expired, "
+                      f"revoked, or lacks access to '{conf['repo']}'")
+    return None, f"GitHub returned {r.status_code} for repo '{conf['repo']}'"
+
+
 def gh_fetch(conf):
     """GET the document. Returns (store_or_None, sha_or_None, error_or_None).
-    A 404 means 'not created yet' — that's a clean empty start, not an error."""
+    A 404 is only a clean empty start once we've confirmed the repo and branch
+    really are reachable — otherwise it's a misconfiguration we must report."""
     try:
         r = requests.get(_gh_url(conf), headers=_gh_headers(conf),
                          params={"ref": conf["branch"]}, timeout=20)
     except Exception as e:
         return None, None, f"network error: {type(e).__name__}"
     if r.status_code == 404:
+        info, err = gh_repo_info(conf)
+        if err:
+            return None, None, err                # bad repo/token: say so loudly
+        default_branch = (info or {}).get("default_branch")
+        if default_branch and default_branch != conf["branch"]:
+            return None, None, (
+                f"branch '{conf['branch']}' doesn't exist here — this repo's "
+                f"default branch is '{default_branch}'. Fix `branch` in Secrets.")
         return empty_store(), None, None          # first run: nothing stored yet
     if r.status_code in (401, 403):
         return None, None, ("auth failed (%d) — token expired, or it lacks "
@@ -610,7 +648,17 @@ def gh_push(conf, store, sha, message):
                       "loaded (another device or tab saved first). Reload "
                       "below, then redo this change.")
     if r.status_code in (401, 403):
-        return None, f"auth failed ({r.status_code}) — check the token"
+        return None, (f"auth failed ({r.status_code}) — the token needs "
+                      f"**Contents: Read and write** on '{conf['repo']}' "
+                      f"(read-only is not enough to save)")
+    if r.status_code == 404:
+        info, err2 = gh_repo_info(conf)
+        if err2:
+            return None, err2
+        return None, (f"GitHub returned 404 writing '{conf['path']}'. The repo is "
+                      f"reachable, so check that branch '{conf['branch']}' exists "
+                      f"and the token has **Contents: Read and write** (a "
+                      f"read-only fine-grained token also yields 404 here).")
     return None, f"GitHub returned {r.status_code}"
 
 
@@ -813,6 +861,73 @@ def new_record(ticker, category="swing", status="Watching", start_date=None,
         "sell_date": None, "sell_price": None, "target_hit_date": None,
         "notes": [], "created_at": _now_str(), "updated_at": _now_str(),
     }
+
+
+def gh_diagnose():
+    """Walk the whole chain and report exactly which link is broken.
+    Returns a list of (ok, label, detail) — never raises, never logs the token."""
+    out = []
+    conf = _secrets_github()
+    if not conf:
+        return [(False, "Secret", "No [github] block found in Secrets — the app "
+                                  "can't save anywhere permanent.")]
+    out.append((True, "Secret", f"repo `{conf['repo']}` · path `{conf['path']}` "
+                                f"· branch `{conf['branch']}`"))
+    if "/" not in conf["repo"]:
+        out.append((False, "Repo name", "`repo` must be the full **owner/name** "
+                                        "(e.g. `yourname/trading-data`)."))
+        return out
+
+    # token identity — proves the token itself is live
+    try:
+        who = requests.get("https://api.github.com/user",
+                           headers=_gh_headers(conf), timeout=20)
+        if who.status_code == 200:
+            out.append((True, "Token", f"valid, authenticated as "
+                                       f"**{who.json().get('login', '?')}**"))
+        elif who.status_code == 401:
+            out.append((False, "Token", "401 — expired, revoked or mistyped."))
+            return out
+        else:
+            out.append((True, "Token", f"accepted (status {who.status_code})"))
+    except Exception as e:
+        out.append((False, "Token", f"network error: {type(e).__name__}"))
+        return out
+
+    info, err = gh_repo_info(conf)
+    if err:
+        out.append((False, "Repo access", err))
+        return out
+    priv = "private" if info.get("private") else "⚠️ PUBLIC"
+    out.append((True, "Repo access", f"found ({priv}, default branch "
+                                     f"`{info.get('default_branch', '?')}`)"))
+    if info.get("default_branch") and info["default_branch"] != conf["branch"]:
+        out.append((False, "Branch",
+                    f"Secrets say `{conf['branch']}` but this repo's default is "
+                    f"`{info['default_branch']}` — update `branch` in Secrets."))
+    else:
+        out.append((True, "Branch", f"`{conf['branch']}` matches"))
+
+    perms = info.get("permissions") or {}
+    if perms.get("push"):
+        out.append((True, "Write permission", "token can write to this repo"))
+    else:
+        out.append((False, "Write permission",
+                    "the token appears to be READ-ONLY here. Set **Contents: "
+                    "Read and write** on the token (Settings → Developer "
+                    "settings → Fine-grained tokens → your token → "
+                    "Permissions → Repository permissions → Contents)."))
+
+    store, sha, ferr = gh_fetch(conf)
+    if ferr:
+        out.append((False, "Data file", ferr))
+    elif sha:
+        out.append((True, "Data file", f"`{conf['path']}` exists with "
+                                       f"{len(store['records'])} record(s)"))
+    else:
+        out.append((True, "Data file", f"`{conf['path']}` not created yet — it "
+                                       f"appears on your first save"))
+    return out
 
 
 def backend_badge():
@@ -1822,6 +1937,12 @@ with st.sidebar.expander("🗄 Tracker storage"):
                      "device, or to clear a conflict."):
         load_store(force=True)
         st.rerun()
+    if st.button("🔍 Test connection", key="sb_diag", width="stretch",
+                 help="Checks the token, repo, branch and write permission one "
+                      "by one, and names the exact link that's broken."):
+        st.session_state["_diag"] = gh_diagnose()
+    for _ok, _lbl, _dt in st.session_state.get("_diag", []):
+        st.markdown(f"{'✅' if _ok else '❌'} **{_lbl}** — {_dt}")
     if not _secrets_github():
         st.caption("**To persist on Streamlit Cloud**, create a PRIVATE data "
                    "repo and a fine-grained token with *Contents: read & write* "
@@ -3616,9 +3737,12 @@ def render_tracker(cfg):
         sty = sty.map(lambda v: ("color: #2ecc71" if (v or 0) > 0
                                  else "color: #e74c3c" if (v or 0) < 0 else ""),
                       subset=["P&L %"])
+    # The key carries a generation counter: bumping it after a delete gives a
+    # FRESH widget with no selection, so the panel can't silently re-point at
+    # whichever record slid into the deleted row's position.
     ev = st.dataframe(sty, hide_index=True, width="stretch",
                       on_select="rerun", selection_mode="single-row",
-                      key="trk_df")
+                      key=f"trk_df_{st.session_state.get('_trk_gen', 0)}")
     st.caption("**% since** = move since you started tracking · **Hit** = the "
                "first date it traded at/through your target (derived from "
                "history, always after the start date) · **P&L** is marked at "
@@ -3627,7 +3751,11 @@ def render_tracker(cfg):
                "_Swipe the table sideways on a phone to reach every column._")
 
     sel = ev.selection.rows if (ev and ev.selection) else []
-    if not sel:
+    # The dataframe keeps its selected ROW NUMBER across reruns, but the list
+    # underneath can get shorter (delete, a status change that the filter now
+    # hides, a narrower filter). A stale index must fall back to the list view
+    # instead of raising IndexError.
+    if not sel or sel[0] >= len(shown):
         render_backup(store, "list")
         return
 
@@ -3775,9 +3903,12 @@ def render_tracker(cfg):
                           key=f"dc_{rec['id']}")
     if st.button("Delete permanently", key=f"db_{rec['id']}", disabled=not confirm,
                  width="stretch"):
+        gone = rec["ticker"]
         ok, err = delete_record(rec["id"])
         if ok:
-            st.success("Deleted.")
+            # new table generation -> selection cleared, panel closes cleanly
+            st.session_state["_trk_gen"] = st.session_state.get("_trk_gen", 0) + 1
+            st.toast(f"Deleted {gone}.")
             st.rerun()
         st.error(err)
 
@@ -4433,7 +4564,9 @@ elif mode == "Scan multiple":
         event = st.dataframe(styler, width="stretch", hide_index=True,
                              on_select="rerun", selection_mode="single-row", key="scan_df")
         sel = event.selection.rows if (event and event.selection) else []
-        if sel:
+        # same stale-row-number guard as the Tracker: a re-scan can return
+        # fewer rows than were showing when the selection was made
+        if sel and sel[0] < len(table):
             sel_ticker = str(table.iloc[sel[0]]["Ticker"])
             if st.session_state.get("scan_detail") != sel_ticker:
                 st.session_state["scan_detail"] = sel_ticker
